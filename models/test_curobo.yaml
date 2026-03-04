@@ -1,0 +1,73 @@
+robot_cfg:
+  kinematics:
+    urdf_path: "/home/gaga/capstone_ws/src/capstone_pkg/models/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
+    asset_root_path: /home/gaga/capstone_ws/src/capstone_pkg/models/urdf/ffw_sg2_rev1_follower
+
+    base_link: base_link
+    ee_link: gripper_l_rh_p12_rn_base
+
+    link_names:
+      - gripper_l_rh_p12_rn_base
+      - gripper_r_rh_p12_rn_base
+
+    collision_link_names:
+      - arm_base_link
+      - arm_l_link1
+      - arm_l_link2
+      - arm_l_link3
+      - arm_l_link4
+      - arm_l_link5
+      - arm_l_link6
+      - arm_l_link7
+      - gripper_l_rh_p12_rn_base
+      - gripper_l_rh_p12_rn_r1
+      - gripper_l_rh_p12_rn_r2
+      - gripper_l_rh_p12_rn_l1
+      - gripper_l_rh_p12_rn_l2
+      - arm_r_link1
+      - arm_r_link2
+      - arm_r_link3
+      - arm_r_link4
+      - arm_r_link5
+      - arm_r_link6
+      - arm_r_link7
+      - gripper_r_rh_p12_rn_base
+      - gripper_r_rh_p12_rn_r1
+      - gripper_r_rh_p12_rn_r2
+      - gripper_r_rh_p12_rn_l1
+      - gripper_r_rh_p12_rn_l2
+
+    lock_joints:
+      lift_joint: 0.0
+      gripper_l_joint1: 0.0
+      gripper_r_joint1: 0.0
+
+    collision_spheres: spheres/ffw_sg2_spheres.yaml
+    collision_sphere_buffer: 0.0
+
+    extra_collision_spheres: {}
+    self_collision_ignore: {}
+    self_collision_buffer: {}
+
+    # lock_joints:
+    #   gripper_l_joint1: 0.0
+    #   gripper_l_joint3: 0.0
+    #   gripper_r_joint1: 0.0
+    #   gripper_r_joint3: 0.0
+
+  cspace:
+    joint_names:
+      - arm_l_joint1
+      - arm_l_joint2
+      - arm_l_joint3
+      - arm_l_joint4
+      - arm_l_joint5
+      - arm_l_joint6
+      - arm_l_joint7
+      - arm_r_joint1
+      - arm_r_joint2
+      - arm_r_joint3
+      - arm_r_joint4
+      - arm_r_joint5
+      - arm_r_joint6
+      - arm_r_joint7

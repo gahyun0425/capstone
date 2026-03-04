@@ -1,0 +1,36 @@
+from __future__ import annotations
+from pathlib import Path
+import os
+
+ROBOT_XML = "/home/gaga/capstone_ws/src/capstone_pkg/models/ffw_sg2.xml"
+ROBOT_URDF = "/home/gaga/capstone_ws/src/capstone_pkg/models/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
+ROBOT_YAML = "/home/gaga/capstone_ws/src/capstone_pkg/models/test_curobo.yaml"
+WORLD_YAML = "/home/gaga/capstone_ws/src/capstone_pkg/models/world_collision.yaml"
+
+BASE_FRAME = "base_link"
+LEFT_EE_FRAME  = "gripper_l_rh_p12_rn_base"
+RIGHT_EE_FRAME = "gripper_r_rh_p12_rn_base"
+
+LEFT_PREFIX  = "arm_l_joint"
+RIGHT_PREFIX = "arm_r_joint"
+
+LEFT_JOINTS = [
+    "arm_l_joint1","arm_l_joint2","arm_l_joint3","arm_l_joint4","arm_l_joint5","arm_l_joint6","arm_l_joint7",
+]
+RIGHT_JOINTS = [
+    "arm_r_joint1","arm_r_joint2","arm_r_joint3","arm_r_joint4","arm_r_joint5","arm_r_joint6","arm_r_joint7",
+]
+
+# # 환경변수로 덮어쓰기 가능하게(선택)
+# ROBOT_XML = Path(os.environ.get("PARALLEL_TB_WORLD_YAML", str(DEFAULT_ROBOT_XML)))
+# ROBOT_URDF = Path(os.environ.get("PARALLEL_TB_WORLD_YAML", str(DEFAULT_ROBOT_URDF)))
+# ROBOT_YAML = Path(os.environ.get("PARALLEL_TB_ROBOT_YAML", str(DEFAULT_ROBOT_YAML)))
+# WORLD_YAML = Path(os.environ.get("PARALLEL_TB_ROBOT_YAML", str(DEFAULT_WORLD_YAML)))
+
+
+
+# # 문자열이 필요한 코드용
+# ROBOT_XML_STR = str(ROBOT_XML)
+# ROBOT_URDF_STR = str(ROBOT_URDF)
+# ROBOT_YAML_STR = str(ROBOT_YAML)
+# WORLD_YAML_STR = str(WORLD_YAML)
