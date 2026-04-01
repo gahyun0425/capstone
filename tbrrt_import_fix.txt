@@ -1,0 +1,2 @@
+Added backward-compatible alias in capstone_pkg/planner/tbrrt_runner.py:
+run_tbrrt = main_tbrrt

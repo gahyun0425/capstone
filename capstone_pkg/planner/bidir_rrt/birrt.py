@@ -72,9 +72,10 @@ def plan_birrt_jointspace(
     cspace_joint_names: List[str],
     cpu: bool = False,
     step: float = 0.15,
-    max_iters: int = 6000,
+    max_iters: int = 100000,
     goal_bias: float = 0.10,
     connect_threshold: float = 0.20,
+    world_yml: Optional[str] = None,
 ) -> Tuple[bool, List[List[float]]]:
     """Bi-directional RRT in joint-space (full cspace vector), expanding only selected arm joints.
     Returns (success, path) where path is list of q vectors in cspace order.
@@ -97,8 +98,8 @@ def plan_birrt_jointspace(
     uppers = np.asarray(jl.upper, dtype=np.float32)
 
     # collision checkers
-    sc = get_self_collision_checker(robot_yml, cpu=cpu)
-    ec = EdgeCollisionChecker(robot_yml, cpu=cpu)
+    sc = get_self_collision_checker(robot_yml, cpu=cpu, world_yml=world_yml)
+    ec = EdgeCollisionChecker(robot_yml, cpu=cpu, world_yml=world_yml)
 
     # validate endpoints
     in0, _, _ = sc.check_single(q0.tolist())

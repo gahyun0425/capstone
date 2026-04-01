@@ -162,7 +162,7 @@
   <joint name="arm_l_joint1" type="revolute">
     <parent link="arm_base_link"/>
     <child link="arm_l_link1"/>
-    <origin rpy="0 0 0" xyz="0 0.1045 0"/>
+    <origin rpy="0 0.047 0" xyz="0 0.1045 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="1000" lower="-3.14" upper="3.14" velocity="4.8"/>
     <dynamics damping="0.1"/>
@@ -405,7 +405,7 @@
   <joint name="arm_r_joint1" type="revolute">
     <parent link="arm_base_link"/>
     <child link="arm_r_link1"/>
-    <origin rpy="0 0 0" xyz="0 -0.1045 0"/>
+    <origin rpy="0 0.025 0" xyz="0 -0.1045 0"/>
     <axis xyz="0 1 0"/>
     <limit effort="1000" lower="-3.14" upper="3.14" velocity="4.8"/>
     <dynamics damping="0.1"/>

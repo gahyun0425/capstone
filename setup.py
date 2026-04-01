@@ -41,11 +41,13 @@ setup(
     },
     entry_points={
         'console_scripts': [
+            'main = capstone_pkg.main:main',
             'simulation = capstone_pkg.simulation:main',
             'realsense = capstone_pkg.camera.view_realsense:main',
             'zed = capstone_pkg.camera.view_zed:main',
             'curobo_ik = capstone_pkg.kinematics.curobo_test_ik:main',
-            'bidir_rrt = capstone_pkg.planner.bidir_rrt.main:main',
+            'bidir_rrt = capstone_pkg.main:main_birrt',
+            'impedance = capstone_pkg.impedance.impedance:main',
         ],
     },
 )

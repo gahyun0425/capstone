@@ -15,7 +15,7 @@ from curobo.wrap.model.robot_world import RobotWorld, RobotWorldConfig
 from curobo.types.state import JointState
 
 from capstone_pkg.utils.config import WORLD_YAML
-from capstone_pkg.collision_check.attach_utils import extract_object_cuboids_from_mujoco_xml, merge_cuboids_to_aabb
+from capstone_pkg.collision_check.attach_utils import extract_object_cuboids_from_mujoco_xml, merge_cuboids_to_aabb, make_box_cuboid
 from capstone_pkg.collision_check.collision_link import ensure_collision_fields, add_connected_link_collision_ignores
 
 def _quat_wxyz_to_rotmat(qw: float, qx: float, qy: float, qz: float) -> torch.Tensor:
@@ -269,7 +269,7 @@ class SelfCollisionChecker:
         print("[SELF_COLLISION] LOADED FROM:", os.path.abspath(__file__))
 
         self.robot_yml = robot_yml
-        self.world_yml = world_yml if world_yml is not None else WORLD_YAML
+        self.world_yml = world_yml
         self.cpu = bool(cpu)
         self.debug_world_stats = bool(debug_world_stats)
 
@@ -301,20 +301,21 @@ class SelfCollisionChecker:
             robot_cfg = RobotConfig.from_dict(robot_cfg_for_curobo)
 
         # -----------------------------
-        # 2) world yaml dict 로 직접 로드
+        # 2) world yaml dict 로 직접 로드 (None이면 self collision만 사용)
         # -----------------------------
-        raw_world = _load_yaml_utf8(self.world_yml)
-        world_model = _normalize_world_model(raw_world)
-        _validate_world_model(world_model)
-
-        world_model = _apply_world_offset(world_model, (0.0, 0.0, 0.0))
+        if self.world_yml in (None, "", "none", "None"):
+            world_model = {}
+            self.world_yml = None
+            print("[WORLD-DEBUG] world collision disabled (world_yml=None)")
+        else:
+            raw_world = _load_yaml_utf8(self.world_yml)
+            world_model = _normalize_world_model(raw_world)
+            _validate_world_model(world_model)
+            world_model = _apply_world_offset(world_model, (0.0, 0.0, 0.0))
+            visualize_world_model_to_png(world_model, out_path="world_colliders.png")
 
         # ✅ keep a copy for plotting/debug
         self.world_model = world_model
-
-        # ✅ world collision 모델 시각화(한 번만)
-        visualize_world_model_to_png(world_model, out_path="world_colliders.png")
-
 
         # -----------------------------
         # 3) RobotWorld 구성 (world_model=dict)
@@ -323,7 +324,7 @@ class SelfCollisionChecker:
             robot_config=robot_cfg,
             world_model=world_model,
             tensor_args=self.tensor_args,
-            collision_activation_distance=0.02,
+            collision_activation_distance=0.01,
             self_collision_activation_distance=0.01,
         )
         self.robot_world = RobotWorld(rw_cfg)
@@ -614,6 +615,63 @@ class SelfCollisionChecker:
         if not ok:
             raise RuntimeError("attach_external_objects_to_robot returned False")
 
+    def attach_cuboid_to_robot(
+        self,
+        *,
+        cuboid: Cuboid,
+        q_model_order: torch.Tensor,
+        link_name: str,
+        disable_in_world: bool = True,
+    ):
+        """Attach a user-defined cuboid to the robot link for post-grasp planning/use."""
+        if disable_in_world:
+            try:
+                self.set_world_obstacles_enabled([cuboid.name], enable=False)
+            except Exception:
+                pass
+
+        kin = self.robot_world.kinematics
+        if not hasattr(kin, "attach_external_objects_to_robot"):
+            raise RuntimeError("robot_world.kinematics has no attach_external_objects_to_robot()")
+
+        js = JointState(
+            position=q_model_order.view(1, -1),
+            joint_names=list(kin.joint_names),
+        )
+        ok = kin.attach_external_objects_to_robot(
+            joint_state=js,
+            external_objects=[cuboid],
+            link_name=link_name,
+            surface_sphere_radius=0.001,
+        )
+        if not ok:
+            raise RuntimeError("attach_external_objects_to_robot returned False")
+
+    def attach_box_object_to_robot(
+        self,
+        *,
+        center_xyz: list[float] | tuple[float, float, float],
+        dims_xyz: list[float] | tuple[float, float, float],
+        q_model_order: torch.Tensor,
+        link_name: str,
+        object_name: str = "grasp_object",
+        quat_wxyz: list[float] | tuple[float, float, float, float] | None = None,
+        disable_in_world: bool = True,
+    ):
+        cuboid = make_box_cuboid(
+            name=object_name,
+            center_xyz=center_xyz,
+            dims_xyz=dims_xyz,
+            quat_wxyz=quat_wxyz,
+        )
+        self.attach_cuboid_to_robot(
+            cuboid=cuboid,
+            q_model_order=q_model_order,
+            link_name=link_name,
+            disable_in_world=disable_in_world,
+        )
+
+
 
 # ---------------------------------------------------------
 # cache
@@ -622,8 +680,6 @@ _CHECKER_CACHE: dict[tuple, SelfCollisionChecker] = {}
 
 
 def get_self_collision_checker(robot_yml: str, *, cpu: bool = False, world_yml: Optional[str] = None) -> SelfCollisionChecker:
-    if world_yml is None:
-        world_yml = WORLD_YAML
     key = (robot_yml, bool(cpu), world_yml)
     ck = _CHECKER_CACHE.get(key)
     if ck is None:

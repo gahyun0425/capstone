@@ -1,0 +1,10 @@
+{
+  "python.analysis.extraPaths": [
+    "/usr/lib/python3/dist-packages",
+    "/usr/lib/python3.10/dist-packages"
+  ],
+  "python.autoComplete.extraPaths": [
+    "/usr/lib/python3/dist-packages",
+    "/usr/lib/python3.10/dist-packages"
+  ]
+}

@@ -11,7 +11,12 @@ from curobo.types.robot import RobotConfig
 from curobo.util_file import load_yaml
 from curobo.wrap.reacher.ik_solver import IKSolver, IKSolverConfig
 
-from capstone_pkg.utils.config import LEFT_EE_FRAME, RIGHT_EE_FRAME
+from capstone_pkg.utils.config import (
+    LEFT_EE_FRAME,
+    RIGHT_EE_FRAME,
+    LEFT_JOINTS,
+    RIGHT_JOINTS,
+)
 from capstone_pkg.collision_check.collision import get_self_collision_checker
 
 @dataclass
@@ -113,6 +118,34 @@ def _map_cspace_q_to_active(
 ) -> List[float]:
     name_to_val = {n: v for n, v in zip(cspace_joint_names, q_cspace)}
     return [float(name_to_val.get(jn, 0.0)) for jn in active_joint_names]
+
+
+def _merge_active_q_to_cspace(
+    q_active: List[float],
+    active_joint_names: List[str],
+    cspace_joint_names: List[str],
+    *,
+    q_base_cspace: Optional[List[float]] = None,
+    update_joint_names: Optional[List[str]] = None,
+) -> List[float]:
+    if q_base_cspace is None:
+        q_out = [0.0 for _ in cspace_joint_names]
+    else:
+        if len(q_base_cspace) != len(cspace_joint_names):
+            raise ValueError(
+                f"q_base_cspace length mismatch: expected {len(cspace_joint_names)}, got {len(q_base_cspace)}"
+            )
+        q_out = [float(v) for v in q_base_cspace]
+
+    name_to_idx = {n: i for i, n in enumerate(cspace_joint_names)}
+    update_set = set(update_joint_names) if update_joint_names is not None else None
+    for joint_name, joint_value in zip(active_joint_names, q_active):
+        if update_set is not None and joint_name not in update_set:
+            continue
+        idx = name_to_idx.get(joint_name, None)
+        if idx is not None:
+            q_out[idx] = float(joint_value)
+    return q_out
 
 
 def _ensure_cspace_defaults(robot_cfg: Dict[str, Any]) -> None:
@@ -393,6 +426,7 @@ class SingleArmIK:
         self.tensor_args = TensorDeviceType(device=dev)
 
         self.ee_link = LEFT_EE_FRAME if arm == "left" else RIGHT_EE_FRAME
+        self.controlled_joint_names = list(LEFT_JOINTS if arm == "left" else RIGHT_JOINTS)
 
         cfg = load_yaml(robot_yml)
         robot_cfg_dict: Dict[str, Any] = cfg["robot_cfg"]
@@ -435,6 +469,13 @@ class SingleArmIK:
 
         self.sc = get_self_collision_checker(robot_yml, cpu=cpu, world_yml=world_yml)
         self.active_joint_names = list(self.solver.kinematics.joint_names)
+        self.active_controlled_joint_names = [
+            joint_name for joint_name in self.active_joint_names if joint_name in self.controlled_joint_names
+        ]
+        if not self.active_controlled_joint_names:
+            raise RuntimeError(
+                f"{arm} arm joints were not found in solver active_joint_names: {self.active_joint_names}"
+            )
 
     def solve(
         self,
@@ -465,15 +506,13 @@ class SingleArmIK:
 
         q_active = _extract_q_from_result(res, b=0)
 
-        if q_start_cspace is not None and len(q_start_cspace) == len(self.cspace_joint_names):
-            q_out = list(q_start_cspace)
-            name_to_idx = {n: i for i, n in enumerate(self.cspace_joint_names)}
-            for n, v in zip(self.active_joint_names, q_active):
-                idx = name_to_idx.get(n, None)
-                if idx is not None:
-                    q_out[idx] = float(v)
-        else:
-            q_out = _map_active_q_to_cspace(q_active, self.active_joint_names, self.cspace_joint_names)
+        q_out = _merge_active_q_to_cspace(
+            q_active,
+            self.active_joint_names,
+            self.cspace_joint_names,
+            q_base_cspace=q_start_cspace,
+            update_joint_names=self.active_controlled_joint_names,
+        )
 
         in_col, _, _ = self.sc.check_single(q_out)
         if in_col:

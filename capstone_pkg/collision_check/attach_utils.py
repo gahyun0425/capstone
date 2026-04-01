@@ -127,3 +127,22 @@ def merge_cuboids_to_aabb(cuboids: List[Cuboid], *, merged_name: str = "att_obje
         dims=[dims[0], dims[1], dims[2]],
     )
     return [merged]
+
+
+
+def make_box_cuboid(
+    *,
+    name: str,
+    center_xyz: list[float] | tuple[float, float, float],
+    dims_xyz: list[float] | tuple[float, float, float],
+    quat_wxyz: list[float] | tuple[float, float, float, float] | None = None,
+) -> Cuboid:
+    """Create a cuRobo Cuboid from a user-provided box center/size."""
+    if quat_wxyz is None:
+        quat_wxyz = [1.0, 0.0, 0.0, 0.0]
+    return Cuboid(
+        name=str(name),
+        pose=[float(center_xyz[0]), float(center_xyz[1]), float(center_xyz[2]),
+              float(quat_wxyz[0]), float(quat_wxyz[1]), float(quat_wxyz[2]), float(quat_wxyz[3])],
+        dims=[float(dims_xyz[0]), float(dims_xyz[1]), float(dims_xyz[2])],
+    )
