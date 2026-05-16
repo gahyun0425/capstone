@@ -674,6 +674,21 @@
       <inertia ixx="0.000001" ixy="0.0" ixz="0.0" iyy="0.000001" iyz="0.0" izz="0.000001"/>
     </inertial>
   </link>
+
+  <joint name="gripper_l_tcp_joint" type="fixed">
+    <parent link="gripper_l_rh_p12_rn_base"/>
+    <child link="gripper_l_tcp"/>
+    <origin xyz="0 0 0.1" rpy="0 0 0"/>
+  </joint>
+  <link name="gripper_l_tcp"/>
+
+  <joint name="gripper_r_tcp_joint" type="fixed">
+    <parent link="gripper_r_rh_p12_rn_base"/>
+    <child link="gripper_r_tcp"/>
+    <origin xyz="0 0 0.10" rpy="0 0 0"/>
+  </joint>
+  <link name="gripper_r_tcp"/>
+
   <!-- Joint -->
   <joint name="gripper_l_joint1" type="revolute">
     <parent link="gripper_l_rh_p12_rn_base"/>

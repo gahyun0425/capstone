@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 from dataclasses import dataclass
+import threading
 from typing import Any, Dict, List, Optional
 
+import numpy as np
 import torch
 
 from curobo.types.base import TensorDeviceType
@@ -118,6 +120,29 @@ def _map_cspace_q_to_active(
 ) -> List[float]:
     name_to_val = {n: v for n, v in zip(cspace_joint_names, q_cspace)}
     return [float(name_to_val.get(jn, 0.0)) for jn in active_joint_names]
+
+
+def _build_seed_config_from_cspace_batch(
+    q_cspace_batch: Optional[List[List[float]]],
+    *,
+    cspace_joint_names: List[str],
+    active_joint_names: List[str],
+    device: torch.device,
+) -> Optional[torch.Tensor]:
+    if q_cspace_batch is None:
+        return None
+
+    q_active_batch: List[List[float]] = []
+    for q_cspace in q_cspace_batch:
+        q_active_batch.append(
+            _map_cspace_q_to_active(
+                q_cspace,
+                cspace_joint_names,
+                active_joint_names,
+            )
+        )
+
+    return torch.tensor(q_active_batch, device=device, dtype=torch.float32).unsqueeze(1)
 
 
 def _merge_active_q_to_cspace(
@@ -364,21 +389,34 @@ class FastBimanualIK:
                 self.cspace_joint_names,
                 self.active_joint_names,
             )
+            q_seed = _build_seed_config_from_cspace_batch(
+                [list(q_start_cspace)],
+                cspace_joint_names=self.cspace_joint_names,
+                active_joint_names=self.active_joint_names,
+                device=self.device,
+            )
         else:
             q_base = [0.0 for _ in self.active_joint_names]
+            q_seed = None
 
         # (B=1) batch로 감싸서 Pose 생성
         goal_left = _pose_from_xyz_quat_wxyz_batch([left_xyz], [left_quat_wxyz], self.device)
         goal_right = _pose_from_xyz_quat_wxyz_batch([right_xyz], [right_quat_wxyz], self.device)
 
         with torch.enable_grad():
-            res_l = self.left_solver.solve_batch(goal_left)
+            if q_seed is None:
+                res_l = self.left_solver.solve_batch(goal_left)
+            else:
+                res_l = self.left_solver.solve_batch(goal_left, seed_config=q_seed)
             ok_l = bool(res_l.success[0].detach().cpu().item())
             if not ok_l:
                 return BimanualIKOutput(False, None, self.active_joint_names, None, self.cspace_joint_names)
             q_l = _extract_q_from_result(res_l)
 
-            res_r = self.right_solver.solve_batch(goal_right)
+            if q_seed is None:
+                res_r = self.right_solver.solve_batch(goal_right)
+            else:
+                res_r = self.right_solver.solve_batch(goal_right, seed_config=q_seed)
             ok_r = bool(res_r.success[0].detach().cpu().item())
             if not ok_r:
                 return BimanualIKOutput(False, None, self.active_joint_names, None, self.cspace_joint_names)
@@ -484,41 +522,190 @@ class SingleArmIK:
         *,
         q_start_cspace: Optional[List[float]] = None,
     ) -> SingleArmIKOutput:
-        if q_start_cspace is not None:
-            q_base = _map_cspace_q_to_active(
-                q_start_cspace,
-                self.cspace_joint_names,
-                self.active_joint_names,
-            )
-            # cuRobo expects seed_config shape: (batch, n_seed, dof)
-            q_seed = torch.tensor([q_base], device=self.device, dtype=torch.float32).unsqueeze(1)
-        else:
-            q_seed = torch.zeros((1, 1, len(self.active_joint_names)), device=self.device, dtype=torch.float32)
+        outs = self.solve_batch(
+            [list(xyz)],
+            [list(quat_wxyz)],
+            q_start_cspace=q_start_cspace,
+        )
+        if not outs:
+            return SingleArmIKOutput(False, None)
+        return outs[0]
 
-        goal = _pose_from_xyz_quat_wxyz_batch([xyz], [quat_wxyz], self.device)
+    def solve_batch(
+        self,
+        xyz_batch: List[List[float]],
+        quat_wxyz_batch: List[List[float]],
+        *,
+        q_start_cspace: Optional[List[float]] = None,
+        q_seed_cspace_batch: Optional[List[List[float]]] = None,
+    ) -> List[SingleArmIKOutput]:
+        batch_size = len(xyz_batch)
+        if len(quat_wxyz_batch) != batch_size:
+            raise ValueError(
+                f"quat_wxyz_batch length mismatch: expected {batch_size}, got {len(quat_wxyz_batch)}"
+            )
+        if batch_size <= 0:
+            return []
+        if q_seed_cspace_batch is not None and len(q_seed_cspace_batch) != batch_size:
+            raise ValueError(
+                "q_seed_cspace_batch length mismatch: "
+                f"expected {batch_size}, got {len(q_seed_cspace_batch)}"
+            )
+
+        if q_seed_cspace_batch is not None:
+            q_base_cspace_batch = [[float(v) for v in q] for q in q_seed_cspace_batch]
+        elif q_start_cspace is not None:
+            q_base_cspace_batch = [[float(v) for v in q_start_cspace] for _ in range(batch_size)]
+        else:
+            q_base_cspace_batch = None
+
+        seed_config = _build_seed_config_from_cspace_batch(
+            q_base_cspace_batch,
+            cspace_joint_names=self.cspace_joint_names,
+            active_joint_names=self.active_joint_names,
+            device=self.device,
+        )
+        goal = _pose_from_xyz_quat_wxyz_batch(xyz_batch, quat_wxyz_batch, self.device)
 
         with torch.enable_grad():
-            res = self.solver.solve_batch(goal, seed_config=q_seed)
+            if seed_config is None:
+                res = self.solver.solve_batch(goal)
+            else:
+                res = self.solver.solve_batch(goal, seed_config=seed_config)
 
-        ok = bool(res.success[0].detach().cpu().item())
-        if not ok:
-            return SingleArmIKOutput(False, None)
+        ok_all = res.success.detach().cpu().tolist()
+        q_out_batch: List[Optional[List[float]]] = [None for _ in range(batch_size)]
+        valid_indices: List[int] = []
+        valid_q_batch: List[List[float]] = []
 
-        q_active = _extract_q_from_result(res, b=0)
+        for batch_idx in range(batch_size):
+            if not bool(ok_all[batch_idx]):
+                continue
 
-        q_out = _merge_active_q_to_cspace(
-            q_active,
-            self.active_joint_names,
-            self.cspace_joint_names,
-            q_base_cspace=q_start_cspace,
-            update_joint_names=self.active_controlled_joint_names,
+            q_active = _extract_q_from_result(res, b=batch_idx)
+            q_out = _merge_active_q_to_cspace(
+                q_active,
+                self.active_joint_names,
+                self.cspace_joint_names,
+                q_base_cspace=None if q_base_cspace_batch is None else q_base_cspace_batch[batch_idx],
+                update_joint_names=self.active_controlled_joint_names,
+            )
+            q_out_batch[batch_idx] = q_out
+            valid_indices.append(batch_idx)
+            valid_q_batch.append(q_out)
+
+        if valid_q_batch:
+            batch_col = self.sc.check_batch(valid_q_batch)
+            in_collision_all = batch_col.in_collision.detach().cpu().tolist()
+            for local_idx, in_collision in enumerate(in_collision_all):
+                if bool(in_collision):
+                    q_out_batch[valid_indices[local_idx]] = None
+
+        outs: List[SingleArmIKOutput] = []
+        for q_out in q_out_batch:
+            if q_out is None:
+                outs.append(SingleArmIKOutput(False, None))
+            else:
+                outs.append(SingleArmIKOutput(True, list(q_out)))
+        return outs
+
+
+_SINGLE_ARM_IK_CACHE: dict[tuple, SingleArmIK] = {}
+_SINGLE_ARM_IK_CACHE_LOCK = threading.Lock()
+
+
+def get_single_arm_ik(
+    robot_yml: str,
+    *,
+    arm: str,
+    cpu: bool = False,
+    num_seeds: int = 20,
+    rotation_threshold: float = 0.05,
+    position_threshold: float = 0.005,
+    use_cuda_graph: bool = True,
+    world_yml: Optional[str] = None,
+) -> SingleArmIK:
+    key = (
+        str(robot_yml),
+        str(arm),
+        bool(cpu),
+        int(num_seeds),
+        float(rotation_threshold),
+        float(position_threshold),
+        bool(use_cuda_graph),
+        None if world_yml in (None, "", "none", "None") else str(world_yml),
+    )
+    with _SINGLE_ARM_IK_CACHE_LOCK:
+        cached = _SINGLE_ARM_IK_CACHE.get(key)
+        if cached is None:
+            cached = SingleArmIK(
+                robot_yml,
+                arm=arm,
+                cpu=cpu,
+                num_seeds=num_seeds,
+                rotation_threshold=rotation_threshold,
+                position_threshold=position_threshold,
+                use_cuda_graph=use_cuda_graph,
+                world_yml=world_yml,
+            )
+            _SINGLE_ARM_IK_CACHE[key] = cached
+        return cached
+
+
+def warmup_single_arm_ik_reachable(
+    ik: SingleArmIK,
+    *,
+    iters: int = 1,
+    batch_size: int = 32,
+    noise_std: float = 0.25,
+    random_seed: int = 0,
+) -> None:
+    if iters <= 0:
+        return
+
+    low_bounds = ik.solver.solver.safety_rollout.action_bound_lows.detach().cpu().numpy()
+    high_bounds = ik.solver.solver.safety_rollout.action_bound_highs.detach().cpu().numpy()
+    rng = np.random.default_rng(int(random_seed))
+
+    for _ in range(int(iters)):
+        q_active_base = ik.solver.sample_configs(1)
+        kin = ik.solver.fk(q_active_base)
+        base_active = q_active_base[0].detach().cpu().numpy()
+        base_cspace = _map_active_q_to_cspace(
+            [float(v) for v in base_active.tolist()],
+            ik.active_joint_names,
+            ik.cspace_joint_names,
         )
 
-        in_col, _, _ = self.sc.check_single(q_out)
-        if in_col:
-            return SingleArmIKOutput(False, None)
+        goal_xyz = [float(v) for v in kin.ee_position[0].detach().cpu().tolist()]
+        goal_quat = [float(v) for v in kin.ee_quaternion[0].detach().cpu().tolist()]
+        q_seed_cspace_batch: List[List[float]] = [list(base_cspace)]
+        for _seed_idx in range(max(0, int(batch_size) - 1)):
+            noisy_active = base_active + rng.normal(loc=0.0, scale=float(noise_std), size=base_active.shape)
+            noisy_active = np.clip(noisy_active, low_bounds, high_bounds)
+            q_seed_cspace_batch.append(
+                _map_active_q_to_cspace(
+                    [float(v) for v in noisy_active.tolist()],
+                    ik.active_joint_names,
+                    ik.cspace_joint_names,
+                )
+            )
 
-        return SingleArmIKOutput(True, q_out)
+        _ = ik.solve_batch(
+            [list(goal_xyz) for _ in range(len(q_seed_cspace_batch))],
+            [list(goal_quat) for _ in range(len(q_seed_cspace_batch))],
+            q_start_cspace=base_cspace,
+            q_seed_cspace_batch=q_seed_cspace_batch,
+        )
+
+    try:
+        _ = ik.sc.check_single([0.0 for _ in ik.cspace_joint_names])
+    except Exception:
+        pass
+
+    if ik.device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize()
+
 
 _SOLVER_CACHE: dict[tuple, FastBimanualIK] = {}
 
@@ -531,6 +718,7 @@ def solve_batch_bimanual(
     right_quat_wxyz_batch: List[List[float]],
     *,
     q_start_cspace: Optional[List[float]] = None,
+    q_seed_cspace_batch: Optional[List[List[float]]] = None,
     parallel_cuda_streams: bool = True,
 ) -> List[BimanualIKOutput]:
     """
@@ -547,15 +735,36 @@ def solve_batch_bimanual(
     assert len(right_xyz_batch) == B
     assert len(right_quat_wxyz_batch) == B
 
-    # q_base 준비(모든 batch에 동일하게 적용)
-    if q_start_cspace is not None:
-        q_base = _map_cspace_q_to_active(
-            q_start_cspace,
-            self.cspace_joint_names,
-            self.active_joint_names,
+    if q_seed_cspace_batch is not None and len(q_seed_cspace_batch) != B:
+        raise ValueError(
+            f"q_seed_cspace_batch length mismatch: expected {B}, got {len(q_seed_cspace_batch)}"
         )
+
+    if q_seed_cspace_batch is not None:
+        q_base_cspace_batch = [[float(v) for v in q] for q in q_seed_cspace_batch]
+    elif q_start_cspace is not None:
+        q_base_cspace_batch = [[float(v) for v in q_start_cspace] for _ in range(B)]
     else:
-        q_base = [0.0 for _ in self.active_joint_names]
+        q_base_cspace_batch = None
+
+    if q_base_cspace_batch is not None:
+        q_base_active_batch = [
+            _map_cspace_q_to_active(
+                q_cspace,
+                self.cspace_joint_names,
+                self.active_joint_names,
+            )
+            for q_cspace in q_base_cspace_batch
+        ]
+    else:
+        q_base_active_batch = [[0.0 for _ in self.active_joint_names] for _ in range(B)]
+
+    seed_config = _build_seed_config_from_cspace_batch(
+        q_base_cspace_batch,
+        cspace_joint_names=self.cspace_joint_names,
+        active_joint_names=self.active_joint_names,
+        device=self.device,
+    )
 
     goal_left = _pose_from_xyz_quat_wxyz_batch(left_xyz_batch, left_quat_wxyz_batch, self.device)
     goal_right = _pose_from_xyz_quat_wxyz_batch(right_xyz_batch, right_quat_wxyz_batch, self.device)
@@ -570,14 +779,24 @@ def solve_batch_bimanual(
             s_r = torch.cuda.Stream()
 
             with torch.cuda.stream(s_l):
-                res_l = self.left_solver.solve_batch(goal_left)
+                if seed_config is None:
+                    res_l = self.left_solver.solve_batch(goal_left)
+                else:
+                    res_l = self.left_solver.solve_batch(goal_left, seed_config=seed_config)
             with torch.cuda.stream(s_r):
-                res_r = self.right_solver.solve_batch(goal_right)
+                if seed_config is None:
+                    res_r = self.right_solver.solve_batch(goal_right)
+                else:
+                    res_r = self.right_solver.solve_batch(goal_right, seed_config=seed_config)
 
             torch.cuda.synchronize()
         else:
-            res_l = self.left_solver.solve_batch(goal_left)
-            res_r = self.right_solver.solve_batch(goal_right)
+            if seed_config is None:
+                res_l = self.left_solver.solve_batch(goal_left)
+                res_r = self.right_solver.solve_batch(goal_right)
+            else:
+                res_l = self.left_solver.solve_batch(goal_left, seed_config=seed_config)
+                res_r = self.right_solver.solve_batch(goal_right, seed_config=seed_config)
 
     ok_l = res_l.success.detach().cpu().tolist()
     ok_r = res_r.success.detach().cpu().tolist()
@@ -598,7 +817,7 @@ def solve_batch_bimanual(
         q_r = _extract_q_from_result(res_r, b=b)
 
         # 이름 기반 merge
-        q_out = list(q_base)
+        q_out = list(q_base_active_batch[b])
 
         l_map = {n: float(v) for n, v in zip(l_names, q_l)}
         r_map = {n: float(v) for n, v in zip(r_names, q_r)}

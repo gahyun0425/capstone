@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional, Tuple
 
 import numpy as np
 import torch
 
 from capstone_pkg.utils.joint_limit import JointLimitsTorch
 from capstone_pkg.constraint_projection.constraint import RigidConstraint
-
 
 # -----------------------------
 # Results
@@ -62,16 +61,35 @@ class ManifoldProjector:
         max_iters: int = 25,
         tol: float = 1e-4,
         fd_eps: float = 1e-4,
+        damping: float = 0.0,
+        step_size: float = 1.0,
     ):
         self.c = constraint
         self.limits = limits
         self.max_iters = int(max_iters)
         self.tol = float(tol)
         self.fd_eps = float(fd_eps)
+        if float(damping) < 0.0:
+            raise ValueError("damping must be >= 0")
+        if float(step_size) <= 0.0:
+            raise ValueError("step_size must be > 0")
+        self.damping = float(damping)
+        self.step_size = float(step_size)
 
     @torch.no_grad()
     def residual(self, q: torch.Tensor) -> torch.Tensor:
         return self.c.h(q)
+
+    @torch.no_grad()
+    def residual_and_jacobian_if_available(
+        self,
+        q: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        analytic_pair = self.c.residual_and_jacobian_torch(q)
+        if analytic_pair is not None:
+            h, J = analytic_pair
+            return h, J.contiguous()
+        return self.residual(q), None
 
     def _h_torch(self, q_np: np.ndarray, device: torch.device, dtype: torch.dtype) -> np.ndarray:
         q = torch.as_tensor(q_np, device=device, dtype=dtype).view(1, -1)
@@ -154,6 +172,8 @@ class ManifoldProjector:
 
             J = self._jacobian_fd_np(q_np, h0, device, dtype)  # (m,D)
             A = J @ J.T  # (m,m)
+            if self.damping > 0.0:
+                A = A + (self.damping * np.eye(A.shape[0], dtype=A.dtype))
 
             # Solve A x = h0, dq = -J^T x
             try:
@@ -162,7 +182,7 @@ class ManifoldProjector:
                 x = np.linalg.pinv(A) @ h0.reshape(-1, 1)
 
             dq = -(J.T @ x).reshape(-1)  # (D,)
-            q_np = q_np + dq
+            q_np = q_np + (self.step_size * dq)
 
             if self.limits is not None:
                 q_t = torch.as_tensor(q_np, device=device, dtype=dtype)
@@ -209,12 +229,70 @@ class ManifoldProjectorTorch:
         max_iters: int = 25,
         tol: float = 1e-4,
         fd_eps: float = 1e-4,
+        damping: float = 0.0,
+        step_size: float = 1.0,
     ):
         self.c = constraint
         self.limits = limits
         self.max_iters = int(max_iters)
         self.tol = float(tol)
         self.fd_eps = float(fd_eps)
+        if float(damping) < 0.0:
+            raise ValueError("damping must be >= 0")
+        if float(step_size) <= 0.0:
+            raise ValueError("step_size must be > 0")
+        self.damping = float(damping)
+        self.step_size = float(step_size)
+        self._fixed_tensor_cache: Dict[Tuple[str, Optional[int], torch.dtype, int, int], Tuple[torch.Tensor, torch.Tensor]] = {}
+
+    @staticmethod
+    def _fixed_cache_key(
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        q_dim: int,
+        residual_dim: int,
+    ) -> Tuple[str, Optional[int], torch.dtype, int, int]:
+        return (device.type, device.index, dtype, int(q_dim), int(residual_dim))
+
+    def _get_fixed_tensors(
+        self,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+        q_dim: int,
+        residual_dim: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        key = self._fixed_cache_key(
+            device=device,
+            dtype=dtype,
+            q_dim=q_dim,
+            residual_dim=residual_dim,
+        )
+        cached = self._fixed_tensor_cache.get(key)
+        if cached is None:
+            cached = (
+                torch.arange(int(q_dim), device=device, dtype=torch.long),
+                torch.eye(int(residual_dim), device=device, dtype=dtype),
+            )
+            self._fixed_tensor_cache[key] = cached
+        return cached
+
+    @torch.no_grad()
+    def prepare_fixed_tensors(
+        self,
+        *,
+        q_dim: int,
+        residual_dim: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        self._get_fixed_tensors(
+            device=device,
+            dtype=dtype,
+            q_dim=q_dim,
+            residual_dim=residual_dim,
+        )
 
     @torch.no_grad()
     def residual(self, q: torch.Tensor) -> torch.Tensor:
@@ -222,6 +300,17 @@ class ManifoldProjectorTorch:
         if h is not None:
             return h
         return self.c.h(q)
+
+    @torch.no_grad()
+    def residual_and_jacobian_if_available(
+        self,
+        q: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        analytic_pair = self.c.residual_and_jacobian_torch(q)
+        if analytic_pair is not None:
+            h, J = analytic_pair
+            return h, J.contiguous()
+        return self.residual(q), None
 
     @torch.no_grad()
     def _jacobian_fd(self, q: torch.Tensor, h0: torch.Tensor) -> torch.Tensor:
@@ -249,10 +338,15 @@ class ManifoldProjectorTorch:
         N, D = q.shape
         m = h0.shape[-1]
         eps = float(self.fd_eps)
+        diag, _eye = self._get_fixed_tensors(
+            device=q.device,
+            dtype=q.dtype,
+            q_dim=D,
+            residual_dim=m,
+        )
 
         # q_pert: (N, D, D) where for each j we perturb joint j
         q_pert = q.unsqueeze(1).expand(N, D, D).clone()
-        diag = torch.arange(D, device=q.device)
         q_pert[:, diag, diag] += eps
 
         q_pert_flat = q_pert.reshape(N * D, D)
@@ -264,7 +358,12 @@ class ManifoldProjectorTorch:
         return J
 
     @torch.no_grad()
-    def project_batch(self, qs: torch.Tensor, h0_init: Optional[torch.Tensor] = None) -> BatchProjectionResult:
+    def project_batch(
+        self,
+        qs: torch.Tensor,
+        h0_init: Optional[torch.Tensor] = None,
+        J0_init: Optional[torch.Tensor] = None,
+    ) -> BatchProjectionResult:
         if qs.ndim != 2:
             raise ValueError("qs must be (N,D)")
 
@@ -277,21 +376,34 @@ class ManifoldProjectorTorch:
             if h0_init.ndim != 2 or h0_init.shape[0] != N:
                 raise ValueError(f"h0_init must be (N,m), got {tuple(h0_init.shape)}")
             h0_init = h0_init.to(device=device, dtype=dtype)
+        if J0_init is not None:
+            if h0_init is None:
+                raise ValueError("J0_init requires h0_init")
+            if J0_init.ndim != 3 or J0_init.shape[0] != N or J0_init.shape[2] != qs.shape[1]:
+                raise ValueError(f"J0_init must be (N,m,D), got {tuple(J0_init.shape)}")
+            if J0_init.shape[1] != h0_init.shape[1]:
+                raise ValueError(
+                    f"J0_init constraint dim {J0_init.shape[1]} != h0_init constraint dim {h0_init.shape[1]}"
+                )
+            J0_init = J0_init.to(device=device, dtype=dtype)
 
         success = torch.zeros((N,), device=device, dtype=torch.bool)
         iters = torch.zeros((N,), device=device, dtype=torch.int32)
         final_res = torch.full((N,), float("inf"), device=device, dtype=dtype)
+        active_idx = torch.arange(N, device=device, dtype=torch.long)
 
         for k in range(self.max_iters):
-            active = ~success
-            if not bool(active.any().item()):
+            if active_idx.numel() == 0:
                 break
 
-            qa = q[active]
+            qa = q.index_select(0, active_idx)
             analytic_pair = None
+            J0 = None
             # Reuse caller-provided residual for the first iteration when available.
             if k == 0 and h0_init is not None:
-                h0 = h0_init[active]
+                h0 = h0_init.index_select(0, active_idx)
+                if J0_init is not None:
+                    J0 = J0_init.index_select(0, active_idx).contiguous()
             else:
                 analytic_pair = self.c.residual_and_jacobian_torch(qa)
                 if analytic_pair is not None:
@@ -300,29 +412,40 @@ class ManifoldProjectorTorch:
                     h0 = self.residual(qa)  # (Na,m)
             r0 = torch.linalg.norm(h0, dim=-1)
 
-            final_res[active] = r0
+            final_res.index_copy_(0, active_idx, r0)
             newly_ok = (r0 <= self.tol)
 
-            idx_active = torch.nonzero(active, as_tuple=False).squeeze(-1)
-            if newly_ok.any():
-                iters[idx_active[newly_ok]] = k
-                success[idx_active[newly_ok]] = True
+            idx_new_ok = active_idx[newly_ok]
+            if idx_new_ok.numel() > 0:
+                iters[idx_new_ok] = k
+                success[idx_new_ok] = True
 
-            active2 = ~success
-            if not bool(active2.any().item()):
+            still_active_local = ~newly_ok
+            active_idx = active_idx[still_active_local]
+            if active_idx.numel() == 0:
                 break
 
             # active2 is a subset of active before q update; reuse h0 computed above.
-            still_active_local = ~newly_ok
             qa2 = qa[still_active_local]
             h0_2 = h0[still_active_local]
             if analytic_pair is not None:
                 _h_full, J_full = analytic_pair
                 J = J_full[still_active_local].contiguous()
+            elif J0 is not None:
+                J = J0[still_active_local].contiguous()
             else:
                 J = self._jacobian_fd(qa2, h0_2)  # (Na2,m,D)
 
             A = J @ J.transpose(1, 2)      # (Na2,m,m)
+            if self.damping > 0.0:
+                _diag, eye2d = self._get_fixed_tensors(
+                    device=A.device,
+                    dtype=A.dtype,
+                    q_dim=qs.shape[1],
+                    residual_dim=A.shape[-1],
+                )
+                eye = eye2d.unsqueeze(0)
+                A = A + (self.damping * eye)
             b = h0_2.unsqueeze(-1)         # (Na2,m,1)
 
             # Solve A x = b; dq = -J^T x
@@ -334,15 +457,21 @@ class ManifoldProjectorTorch:
                 x[fail] = x2
 
             dq = -(J.transpose(1, 2) @ x).squeeze(-1)  # (Na2,D)
-            q_next = qa2 + dq
+            q_next = qa2 + (self.step_size * dq)
 
             if self.limits is not None:
                 q_next = self.limits.clamp(q_next)
 
-            q[active2] = q_next
+            q.index_copy_(0, active_idx, q_next)
 
-        r_final = torch.linalg.norm(self.residual(q), dim=-1)  # (N,)
-        success = (r_final <= self.tol)
+        r_final = final_res.clone()
+        unresolved_idx = active_idx
+        if unresolved_idx.numel() > 0:
+            q_unresolved = q.index_select(0, unresolved_idx)
+            r_unresolved = torch.linalg.norm(self.residual(q_unresolved), dim=-1)
+            r_final.index_copy_(0, unresolved_idx, r_unresolved)
+            success = success.clone()
+            success[unresolved_idx] = (r_unresolved <= self.tol)
 
         return BatchProjectionResult(
             q_proj=q,

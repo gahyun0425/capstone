@@ -6,7 +6,7 @@ import argparse
 import json
 import math
 
-from capstone_pkg.kinematics.curobo_ik import FastBimanualIK
+from capstone_pkg.kinematics.curobo_ik import FastBimanualIK, get_single_arm_ik
 from capstone_pkg.utils.config import ROBOT_YAML
 
 
@@ -51,6 +51,24 @@ def _read_optional_list(name: str) -> Optional[List[float]]:
     return [float(x) for x in arr]
 
 
+def _parse_float_list(raw: str, *, expected_len: int, name: str) -> List[float]:
+    text = str(raw).strip()
+    if text.startswith("["):
+        arr = json.loads(text)
+        if not isinstance(arr, list):
+            raise ValueError(f"{name} must be a JSON list")
+        out = [float(x) for x in arr]
+    else:
+        if "," in text:
+            parts = [p.strip() for p in text.split(",") if p.strip()]
+        else:
+            parts = [p.strip() for p in text.split() if p.strip()]
+        out = [float(x) for x in parts]
+    if len(out) != expected_len:
+        raise ValueError(f"{name} must have {expected_len} values, got {len(out)}")
+    return out
+
+
 def quat_wxyz_from_rpy_deg(roll_deg: float, pitch_deg: float, yaw_deg: float) -> List[float]:
     """
     roll/pitch/yaw (deg) -> quaternion [w, x, y, z]
@@ -85,6 +103,16 @@ def main():
     ap.add_argument("--rot_th", type=float, default=0.05)
     ap.add_argument("--pos_th", type=float, default=0.005)
     ap.add_argument("--no_cuda_graph", action="store_true")
+    ap.add_argument("--arm", choices=("left", "right"), help="single-arm IK mode")
+    ap.add_argument("--target_xyz", help="single-arm target xyz in meters, ex: '0.63,0.23,1.40'")
+    ap.add_argument(
+        "--target_quat_xyzw",
+        help="single-arm target quaternion in xyzw order, ex: '0.89,-0.04,0.43,0.02'",
+    )
+    ap.add_argument(
+        "--q_start_cspace",
+        help="optional single-arm q_start in YAML cspace joint order as JSON/list string",
+    )
 
     args = ap.parse_args()
 
@@ -92,6 +120,54 @@ def main():
         "[INFO] First cuRobo run may take several minutes for CUDA JIT "
         "compilation (kinematics_fused_cu/geom_cu/lbfgs_step_cu/...)."
     )
+
+    if args.arm and args.target_xyz and args.target_quat_xyzw:
+        target_xyz = _parse_float_list(args.target_xyz, expected_len=3, name="target_xyz")
+        target_quat_xyzw = _parse_float_list(
+            args.target_quat_xyzw,
+            expected_len=4,
+            name="target_quat_xyzw",
+        )
+        target_quat_wxyz = [
+            float(target_quat_xyzw[3]),
+            float(target_quat_xyzw[0]),
+            float(target_quat_xyzw[1]),
+            float(target_quat_xyzw[2]),
+        ]
+        q_start_cspace = None
+        if args.q_start_cspace:
+            q_start_cspace = _parse_float_list(
+                args.q_start_cspace,
+                expected_len=14,
+                name="q_start_cspace",
+            )
+
+        ik = get_single_arm_ik(
+            args.robot_yml,
+            arm=str(args.arm),
+            cpu=bool(args.cpu),
+            num_seeds=int(args.num_seeds),
+            rotation_threshold=float(args.rot_th),
+            position_threshold=float(args.pos_th),
+            use_cuda_graph=(not args.no_cuda_graph),
+        )
+        out = ik.solve(
+            xyz=target_xyz,
+            quat_wxyz=target_quat_wxyz,
+            q_start_cspace=q_start_cspace,
+        )
+
+        print("\n=== Single Arm IK Result ===")
+        print(f"arm: {args.arm}")
+        print(f"target_xyz: {target_xyz}")
+        print(f"target_quat_xyzw: {target_quat_xyzw}")
+        print(f"target_quat_wxyz: {target_quat_wxyz}")
+        print(f"success: {out.success}")
+        if not out.success or out.q_cspace is None:
+            return
+        print(f"q_cspace ({len(out.q_cspace)} joints):")
+        print(out.q_cspace)
+        return
 
     # ✅ solver 1회 생성
     ik = FastBimanualIK(

@@ -92,7 +92,11 @@ def compute_relative_link_path_from_cspace(
 
     cfg = load_yaml(robot_yml)
     kin = cfg["robot_cfg"]["kinematics"]
-    primary_ee = kin.get("ee_link", ee_link) or ee_link
+    # FK 검증에서 특정 링크를 보고 싶을 때는 YAML 기본 ee_link보다
+    # 호출자가 요청한 ee_link를 우선 사용해야 한다.
+    primary_ee = str(ee_link).strip() or (kin.get("ee_link", "") or "")
+    if not primary_ee:
+        raise ValueError("ee_link is empty")
 
     try:
         model_cfg = CudaRobotModelConfig.from_robot_yaml_file(

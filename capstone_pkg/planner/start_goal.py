@@ -12,11 +12,12 @@ import numpy as np
 import torch
 import rclpy
 
-from capstone_pkg.utils.config import LEFT_GRIPPER, RIGHT_GRIPPER
+from capstone_pkg.utils.config import LEFT_GRIPPER, RIGHT_GRIPPER, JOINT_LIMIT
 from capstone_pkg.warmup.warmup_all import WarmupBundle, init_all_and_warmup, now, fmt_s
 from capstone_pkg.kinematics.curobo_ik import solve_batch_bimanual
 from capstone_pkg.constraint_projection.constraint import RigidConstraint, build_bimanual_fk_robotworld
 from capstone_pkg.collision_check.collision import get_self_collision_checker
+from capstone_pkg.utils.joint_limit import load_joint_limits_torch
 
 
 # -----------------------------
@@ -302,6 +303,50 @@ def _apply_planar_xy_target_filter(
     return filtered_pos, filtered_quat
 
 
+def _build_ik_seed_batch(
+    q_start: List[float],
+    *,
+    batch_size: int,
+    noise_std: float,
+    random_seed: int,
+    lower: np.ndarray,
+    upper: np.ndarray,
+) -> List[List[float]]:
+    q0 = np.asarray(q_start, dtype=np.float64)
+    if q0.ndim != 1:
+        raise ValueError(f"q_start must be 1-D, got shape={q0.shape}")
+
+    out: List[List[float]] = [q0.tolist()]
+    if batch_size <= 1 or noise_std <= 0.0:
+        return out
+
+    rng = np.random.default_rng(int(random_seed))
+    for _ in range(int(batch_size) - 1):
+        q_seed = q0 + rng.normal(loc=0.0, scale=float(noise_std), size=q0.shape)
+        q_seed = np.clip(q_seed, lower, upper)
+        out.append(q_seed.tolist())
+    return out
+
+
+def _dedupe_q_candidates(
+    candidates: List[List[float]],
+    *,
+    atol: float,
+) -> List[List[float]]:
+    if atol <= 0.0:
+        return [list(q) for q in candidates]
+
+    unique: List[np.ndarray] = []
+    out: List[List[float]] = []
+    for q in candidates:
+        q_np = np.asarray(q, dtype=np.float64)
+        if any(float(np.linalg.norm(q_np - u)) <= float(atol) for u in unique):
+            continue
+        unique.append(q_np)
+        out.append([float(v) for v in q_np.tolist()])
+    return out
+
+
 # -----------------------------
 # public API (import해서 쓰는 함수)
 # -----------------------------
@@ -328,6 +373,9 @@ def get_start_and_goal_from_topic_and_ik(
     ik_batch: int = 100,
     topk: int = 16,
     planar_xy: bool = False,
+    ik_seed_noise_std: float = 0.25,
+    ik_seed_random_seed: int = 0,
+    ik_goal_dedupe_tol: float = 1.0e-3,
 ) -> Tuple[List[float], List[List[float]], float, float]:
     """
     JointState(q_start) -> (LEFT target 입력) -> RIGHT target 자동 -> batch IK -> collision-free 필터 -> topK 반환
@@ -428,10 +476,20 @@ def get_start_and_goal_from_topic_and_ik(
     # -----------------------------
     t_ik0 = now(device)
 
-    left_xyz_batch = [l_pos for _ in range(int(ik_batch))]
-    left_quat_batch = [l_quat for _ in range(int(ik_batch))]
-    right_xyz_batch = [r_pos for _ in range(int(ik_batch))]
-    right_quat_batch = [r_quat for _ in range(int(ik_batch))]
+    jl = load_joint_limits_torch(JOINT_LIMIT, device=device, dtype=torch.float32)
+    ik_seed_batch = _build_ik_seed_batch(
+        q_start,
+        batch_size=max(1, int(ik_batch)),
+        noise_std=float(ik_seed_noise_std),
+        random_seed=int(ik_seed_random_seed),
+        lower=jl.lower.detach().cpu().numpy(),
+        upper=jl.upper.detach().cpu().numpy(),
+    )
+
+    left_xyz_batch = [l_pos for _ in range(len(ik_seed_batch))]
+    left_quat_batch = [l_quat for _ in range(len(ik_seed_batch))]
+    right_xyz_batch = [r_pos for _ in range(len(ik_seed_batch))]
+    right_quat_batch = [r_quat for _ in range(len(ik_seed_batch))]
 
     ts0 = now(device)
     outs = solve_batch_bimanual(
@@ -441,6 +499,7 @@ def get_start_and_goal_from_topic_and_ik(
         right_xyz_batch,
         right_quat_batch,
         q_start_cspace=q_start,
+        q_seed_cspace_batch=ik_seed_batch,
         parallel_cuda_streams=True,
     )
     ts1 = now(device)
@@ -450,6 +509,11 @@ def get_start_and_goal_from_topic_and_ik(
         if (not o.success) or (o.q_cspace is None):
             continue
         cand_q.append(list(o.q_cspace))
+
+    cand_q = _dedupe_q_candidates(
+        cand_q,
+        atol=float(ik_goal_dedupe_tol),
+    )
 
     if len(cand_q) == 0:
         raise RuntimeError("[start_goal] ❌ batch IK success=0")
@@ -504,7 +568,10 @@ def get_start_and_goal_from_topic_and_ik(
     print(f"[TIME][IK-only] total (batch solve+validate+rank) : {fmt_s(t_ik1 - t_ik0)}")
     print(f"[TIME][IK-only] batch_solve_total                 : {fmt_s(ts1 - ts0)}")
     print(f"[TIME][IK-only] validate_total                    : {fmt_s(tc1 - tc0)}")
-    print(f"[start_goal] batch IK success={len(cand_q)} free={len(free_q)} topk={len(q_goal_topk)}")
+    print(
+        "[start_goal] batch IK "
+        f"seeded={len(ik_seed_batch)} unique_success={len(cand_q)} free={len(free_q)} topk={len(q_goal_topk)}"
+    )
     print("===========================================================\n")
 
     return q_start, q_goal_topk, float(best_pen), float(t_pose_input_done)

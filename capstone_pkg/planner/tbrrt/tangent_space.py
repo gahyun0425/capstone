@@ -49,10 +49,10 @@ def build_tangent_space_fd(
         raise ValueError("q_root must be (D,)")
 
     q = q_root.view(1, -1)
-    h0 = projector.residual(q)         # (1,m)
-
-    # ✅ unified call: both projectors implement _jacobian_fd(q,h0) -> (1,m,D)
-    Jb = projector._jacobian_fd(q, h0)
+    h0, Jb = projector.residual_and_jacobian_if_available(q)
+    if Jb is None:
+        # Fall back to the projector's FD Jacobian only when no analytic backend exists.
+        Jb = projector._jacobian_fd(q, h0)
     J = Jb.squeeze(0).contiguous()     # (m,D)
 
     # SVD for nullspace

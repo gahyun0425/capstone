@@ -8,22 +8,39 @@ if os.environ.get("SPAWN_NO_FORCE_NVIDIA", "0").lower() not in ("1", "true", "ye
     os.environ.setdefault("__GLX_VENDOR_LIBRARY_NAME", "nvidia")
 
 import argparse
+import tempfile
 import threading
 import time
 from typing import Any, Dict, List, Tuple
+import xml.etree.ElementTree as ET
 
-import rclpy
-from rclpy.node import Node
-from sensor_msgs.msg import JointState
-from sensor_msgs.msg import Image
-
-import mujoco
 import glfw
-
+import mujoco
+import rclpy
+from capstone_pkg.utils.world_collision_bridge import (
+    DEFAULT_WORLD_COLLISION_TOPIC,
+    WorldCuboid,
+    parse_world_collision_payload,
+)
 from curobo.util_file import load_yaml
 from rclpy.executors import SingleThreadedExecutor
+from rclpy.node import Node
+from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
+from sensor_msgs.msg import JointState
+from std_msgs.msg import String
 
-from capstone_pkg.utils.config import ROBOT_XML, ROBOT_YAML
+MODEL = "/home/gaga/capstone_ws/src/capstone_pkg/models/ffw_sg2.xml"
+ROBOT_YAML = "/home/gaga/capstone_ws/src/capstone_pkg/models/test_curobo.yaml"
+WORLD_BOX_PREFIX = "capstone_world_collision_box_"
+
+DEFAULT_INIT_Q = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+GRIPPER_CLOSED_JOINTS = [
+    "gripper_l_joint1", "gripper_l_joint2", "gripper_l_joint3", "gripper_l_joint4",
+    "gripper_r_joint1", "gripper_r_joint2", "gripper_r_joint3", "gripper_r_joint4",
+]
+GRIPPER_CLOSED_VALUE = 0.5
+
 
 def _safe_symlink(src: str, dst: str) -> None:
     if os.path.exists(dst) or os.path.islink(dst):
@@ -40,9 +57,37 @@ def _safe_symlink(src: str, dst: str) -> None:
 
 def _ensure_furniture_sim_paths(models_root: str) -> None:
     models_root = os.path.abspath(models_root)
-    base = os.path.join(models_root, "furniture_sim")
-    if not os.path.isdir(base):
+    base_candidates = [
+        os.path.join(models_root, "furniture_sim"),
+        os.path.join(os.path.dirname(models_root), "furniture_sim"),
+    ]
+    base = None
+    for cand in base_candidates:
+        if os.path.isdir(cand):
+            base = cand
+            break
+    if base is None:
         return
+
+    # If MJCF is inside a subfolder (e.g., models/ffw_sg2), expose furniture_sim there.
+    local_base = os.path.join(models_root, "furniture_sim")
+    if not os.path.exists(local_base):
+        _safe_symlink(base, local_base)
+
+    # meshdir="assets" in ffw_sg2_world.xml expects assets under the MJCF folder.
+    assets_src_candidates = [
+        os.path.join(models_root, "assets"),
+        os.path.join(os.path.dirname(models_root), "assets"),
+    ]
+    assets_src = None
+    for cand in assets_src_candidates:
+        if os.path.isdir(cand):
+            assets_src = cand
+            break
+    if assets_src is not None:
+        local_assets = os.path.join(models_root, "assets")
+        if not os.path.exists(local_assets):
+            _safe_symlink(assets_src, local_assets)
 
     dup = os.path.join(base, "furniture_sim")
     _safe_symlink(base, dup)
@@ -80,6 +125,106 @@ def _dt_from_hz(hz: float, default_dt: float) -> float:
     return 1.0 / max(0.1, hz)
 
 
+def _inject_world_box_slots(mjcf_path: str, max_boxes: int, box_group: int) -> str:
+    if max_boxes <= 0:
+        return mjcf_path
+    box_group = max(0, min(5, int(box_group)))
+
+    tree = ET.parse(mjcf_path)
+    root = tree.getroot()
+    models_root = os.path.dirname(os.path.abspath(mjcf_path))
+
+    compiler = root.find("compiler")
+    if compiler is not None:
+        meshdir = compiler.attrib.get("meshdir")
+        if meshdir and not os.path.isabs(meshdir):
+            compiler.set("meshdir", os.path.abspath(os.path.join(models_root, meshdir)))
+
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        worldbody = ET.SubElement(root, "worldbody")
+
+    for idx in range(max_boxes):
+        ET.SubElement(
+            worldbody,
+            "geom",
+            {
+                "name": f"{WORLD_BOX_PREFIX}{idx}",
+                "type": "box",
+                "size": "0.001 0.001 0.001",
+                "pos": "0 0 -10",
+                "quat": "1 0 0 0",
+                "rgba": "0 0 0 0",
+                "contype": "0",
+                "conaffinity": "0",
+                "group": str(box_group),
+            },
+        )
+
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="capstone_mujoco_world_boxes_",
+        suffix=".xml",
+        delete=False,
+    )
+    tmp_path = tmp.name
+    tmp.close()
+    tree.write(tmp_path, encoding="utf-8", xml_declaration=True)
+    return tmp_path
+
+
+def _find_world_box_geom_ids(model: mujoco.MjModel, max_boxes: int) -> List[int]:
+    geom_ids: List[int] = []
+    for idx in range(max_boxes):
+        gid = mujoco.mj_name2id(
+            model,
+            mujoco.mjtObj.mjOBJ_GEOM,
+            f"{WORLD_BOX_PREFIX}{idx}",
+        )
+        if gid < 0:
+            raise RuntimeError(f"World collision box slot not found: {WORLD_BOX_PREFIX}{idx}")
+        geom_ids.append(int(gid))
+    return geom_ids
+
+
+def _hide_world_box(model: mujoco.MjModel, geom_id: int) -> None:
+    model.geom_pos[geom_id] = [0.0, 0.0, -10.0]
+    model.geom_quat[geom_id] = [1.0, 0.0, 0.0, 0.0]
+    model.geom_size[geom_id] = [0.001, 0.001, 0.001]
+    model.geom_rgba[geom_id] = [0.0, 0.0, 0.0, 0.0]
+    model.geom_contype[geom_id] = 0
+    model.geom_conaffinity[geom_id] = 0
+
+
+def apply_world_collision_boxes(
+    model: mujoco.MjModel,
+    data: mujoco.MjData,
+    geom_ids: List[int],
+    cuboids: List[WorldCuboid],
+    *,
+    rgba: List[float],
+    enable_physics_collision: bool,
+) -> int:
+    for geom_id in geom_ids:
+        _hide_world_box(model, geom_id)
+
+    active = min(len(cuboids), len(geom_ids))
+    contype = 1 if enable_physics_collision else 0
+    conaffinity = 1 if enable_physics_collision else 0
+
+    for cuboid, geom_id in zip(cuboids[:active], geom_ids[:active]):
+        x, y, z, qw, qx, qy, qz = cuboid.pose
+        dx, dy, dz = cuboid.dims
+        model.geom_pos[geom_id] = [float(x), float(y), float(z)]
+        model.geom_quat[geom_id] = [float(qw), float(qx), float(qy), float(qz)]
+        model.geom_size[geom_id] = [float(dx) * 0.5, float(dy) * 0.5, float(dz) * 0.5]
+        model.geom_rgba[geom_id] = [float(v) for v in rgba]
+        model.geom_contype[geom_id] = contype
+        model.geom_conaffinity[geom_id] = conaffinity
+
+    mujoco.mj_forward(model, data)
+    return active
+
+
 def get_cspace_joint_names(robot_yml: str) -> List[str]:
     cfg = load_yaml(robot_yml)
     robot_cfg: Dict[str, Any] = cfg["robot_cfg"]
@@ -109,6 +254,7 @@ def build_joint_mapping(model: mujoco.MjModel) -> Dict[str, int]:
             mapping[name] = qpos_adr
     return mapping
 
+
 class JointCmdIO(Node):
     def __init__(self, sub_topic: str):
         super().__init__("mujoco_joint_cmd_io")
@@ -120,7 +266,6 @@ class JointCmdIO(Node):
 
     def _cb(self, msg: JointState):
         d = {}
-        # name/position 길이 다르면 zip이 짧은 쪽에 맞춰짐
         for n, p in zip(list(msg.name), list(msg.position)):
             if isinstance(n, str):
                 d[n] = float(p)
@@ -132,6 +277,35 @@ class JointCmdIO(Node):
         with self._lock:
             return dict(self._latest), int(self._rx)
 
+
+class WorldCollisionIO(Node):
+    def __init__(self, topic: str):
+        super().__init__("mujoco_world_collision_io")
+        self._lock = threading.Lock()
+        self._latest_source = ""
+        self._latest: List[WorldCuboid] = []
+        self._rx = 0
+
+        qos = QoSProfile(depth=1)
+        qos.reliability = QoSReliabilityPolicy.RELIABLE
+        qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
+        self.create_subscription(String, topic, self._cb, qos)
+        self.get_logger().info(f"Subscribed world collision cuboids: {topic}")
+
+    def _cb(self, msg: String):
+        try:
+            source, cuboids = parse_world_collision_payload(msg.data)
+        except Exception as exc:
+            self.get_logger().error(f"Failed to parse world collision payload: {exc}")
+            return
+        with self._lock:
+            self._latest_source = source
+            self._latest = list(cuboids)
+            self._rx += 1
+
+    def get_latest(self) -> Tuple[str, List[WorldCuboid], int]:
+        with self._lock:
+            return self._latest_source, list(self._latest), int(self._rx)
 
 
 class JointStateIO(Node):
@@ -167,7 +341,48 @@ class JointStateIO(Node):
         self.pub.publish(msg)
 
 
-def apply_jointstate_qpos(data: mujoco.MjData, mapping: Dict[str, int], names: List[str], pos: List[float], eps: float) -> bool:
+def apply_init_q_cspace(
+    data: mujoco.MjData,
+    mapping: Dict[str, int],
+    cspace_joint_names: List[str],
+    init_q: List[float],
+) -> int:
+    if len(init_q) != len(cspace_joint_names):
+        raise ValueError(f"init_q length mismatch: {len(init_q)} vs {len(cspace_joint_names)}")
+    applied = 0
+    for jn, v in zip(cspace_joint_names, init_q):
+        adr = mapping.get(jn, None)
+        if adr is None:
+            continue
+        data.qpos[adr] = float(v)
+        applied += 1
+    return applied
+
+
+def apply_gripper_closed(
+    data: mujoco.MjData,
+    mapping: Dict[str, int],
+    joint_names: List[str],
+    value: float = 1.0,
+) -> int:
+    applied = 0
+    for jn in joint_names:
+        adr = mapping.get(jn, None)
+        if adr is None:
+            continue
+        if 0 <= adr < data.qpos.size:
+            data.qpos[adr] = float(value)
+            applied += 1
+    return applied
+
+
+def apply_jointstate_qpos(
+    data: mujoco.MjData,
+    mapping: Dict[str, int],
+    names: List[str],
+    pos: List[float],
+    eps: float,
+) -> bool:
     if not names or not pos:
         return False
     changed = False
@@ -183,7 +398,11 @@ def apply_jointstate_qpos(data: mujoco.MjData, mapping: Dict[str, int], names: L
     return changed
 
 
-def read_q_cspace_from_mujoco(data: mujoco.MjData, mapping: Dict[str, int], cspace_joint_names: List[str]) -> List[float]:
+def read_q_cspace_from_mujoco(
+    data: mujoco.MjData,
+    mapping: Dict[str, int],
+    cspace_joint_names: List[str],
+) -> List[float]:
     out: List[float] = []
     for jn in cspace_joint_names:
         adr = mapping.get(jn, None)
@@ -196,6 +415,7 @@ def read_q_cspace_from_mujoco(data: mujoco.MjData, mapping: Dict[str, int], cspa
 
 def _make_mujoco_viewer(model: mujoco.MjModel, data: mujoco.MjData):
     import importlib
+
     mv = importlib.import_module("mujoco_viewer")
     if hasattr(mv, "MujocoViewer"):
         return mv.MujocoViewer(model, data)
@@ -208,7 +428,7 @@ def _make_mujoco_viewer(model: mujoco.MjModel, data: mujoco.MjData):
                 return sm.MujocoViewer(model, data)
         except Exception:
             pass
-    raise AttributeError(f"mujoco_viewer에서 MujocoViewer를 못 찾음: {getattr(mv,'__file__','?')}")
+    raise AttributeError(f"mujoco_viewer에서 MujocoViewer를 못 찾음: {getattr(mv, '__file__', '?')}")
 
 
 def _viewer_running(viewer) -> bool:
@@ -217,17 +437,16 @@ def _viewer_running(viewer) -> bool:
     except Exception:
         return True
 
+
 def build_actuator_maps(model: mujoco.MjModel):
-    # actuator idx -> name
     act_names = []
     for a in range(model.nu):
         n = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_ACTUATOR, a)
         act_names.append(n if n else f"act{a}")
 
-    # joint_name -> actuator idx (한 joint에 actuator 여러개면 마지막이 덮어씀)
     joint_to_act = {}
     for a in range(model.nu):
-        j_id = int(model.actuator_trnid[a, 0])  # actuator가 걸린 joint id
+        j_id = int(model.actuator_trnid[a, 0])
         jn = mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j_id)
         if jn:
             joint_to_act[jn] = a
@@ -242,7 +461,6 @@ def make_ctrl_hold_from_qpos(model: mujoco.MjModel, data: mujoco.MjData, act_nam
     """
     ctrl_hold = [0.0] * model.nu
 
-    # actuator ctrlrange 있으면 clamp해주기
     def _clamp(a, v):
         try:
             if int(model.actuator_ctrllimited[a]) != 0:
@@ -256,16 +474,12 @@ def make_ctrl_hold_from_qpos(model: mujoco.MjModel, data: mujoco.MjData, act_nam
 
     for a in range(model.nu):
         name = act_names[a]
-
-        # ✅ 너 MJCF에서 velocity actuator는 drive 3개뿐이라 이름으로 구분하는 게 제일 확실
-        # (원하면 아래 set에 더 추가)
         is_velocity = name in ("left_wheel_drive_act", "right_wheel_drive_act", "rear_wheel_drive_act")
 
         if is_velocity:
             ctrl_hold[a] = _clamp(a, 0.0)
             continue
 
-        # position actuator: 해당 joint의 현재 qpos를 목표로
         j_id = int(model.actuator_trnid[a, 0])
         qadr = int(model.jnt_qposadr[j_id])
         q = float(data.qpos[qadr])
@@ -273,36 +487,6 @@ def make_ctrl_hold_from_qpos(model: mujoco.MjModel, data: mujoco.MjData, act_nam
 
     return ctrl_hold
 
-def _make_image_msg(rgb_uint8, stamp, frame_id: str):
-    """
-    rgb_uint8: (H,W,3) uint8 RGB
-    """
-    msg = Image()
-    msg.header.stamp = stamp
-    msg.header.frame_id = frame_id
-    msg.height = int(rgb_uint8.shape[0])
-    msg.width  = int(rgb_uint8.shape[1])
-    msg.encoding = "rgb8"
-    msg.is_bigendian = False
-    msg.step = int(rgb_uint8.shape[1] * 3)
-    msg.data = rgb_uint8.tobytes()
-    return msg
-
-
-def _make_depth32_msg(depth_f32, stamp, frame_id: str):
-    """
-    depth_f32: (H,W) float32 depth (meters)
-    """
-    msg = Image()
-    msg.header.stamp = stamp
-    msg.header.frame_id = frame_id
-    msg.height = int(depth_f32.shape[0])
-    msg.width  = int(depth_f32.shape[1])
-    msg.encoding = "32FC1"
-    msg.is_bigendian = False
-    msg.step = int(depth_f32.shape[1] * 4)  # float32 = 4 bytes
-    msg.data = depth_f32.tobytes()
-    return msg
 
 def main():
     if os.path.basename(__file__) == "mujoco_viewer.py":
@@ -310,51 +494,41 @@ def main():
 
     ap = argparse.ArgumentParser("MuJoCo spawn (CPU-friendly / kinematic)")
 
-    ap.add_argument("--mjcf", default=ROBOT_XML)
     ap.add_argument("--robot_yml", default=ROBOT_YAML)
     ap.add_argument("--sub_topic", default="/joint_states_cmd")
     ap.add_argument("--pub_topic", default="/joint_states")
 
     ap.add_argument("--update_hz", type=float, default=60.0)
     ap.add_argument("--pub_hz", type=float, default=30.0)
-    ap.add_argument("--render_hz", type=float, default=30.0)      # ✅ 창 확인 위해 기본 30
-    ap.add_argument("--idle_render_hz", type=float, default=2.0)  # ✅ 창 유지 위해 기본 2
+    ap.add_argument("--render_hz", type=float, default=30.0)
+    ap.add_argument("--idle_render_hz", type=float, default=2.0)
     ap.add_argument("--idle_after_s", type=float, default=0.2)
-    ap.add_argument("--min_sleep_ms", type=float, default=5.0)    # ✅ 창 반응성 위해 기본 5ms
+    ap.add_argument("--min_sleep_ms", type=float, default=5.0)
     ap.add_argument("--eps", type=float, default=5e-3)
 
     ap.add_argument("--render_only_when_moving", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--no_viewer", action="store_true", default=False)
 
+    ap.add_argument("--init_q", nargs="+", type=float, default=DEFAULT_INIT_Q)
+    ap.add_argument("--no_init_pose", action="store_true")
     ap.add_argument("--ctrl_topic", default="/ctrl_cmd")
+    ap.add_argument("--world_collision_topic", default=DEFAULT_WORLD_COLLISION_TOPIC)
+    ap.add_argument("--max_world_boxes", type=int, default=64)
+    ap.add_argument("--world_box_group", type=int, default=0)
+    ap.add_argument("--world_box_rgba", nargs=4, type=float, default=[0.95, 0.20, 0.05, 0.65])
+    ap.add_argument("--world_box_physics_collision", action=argparse.BooleanOptionalAction, default=False)
 
-    # -------- Camera publish (RealSense-style topics) --------
-    ap.add_argument("--pub_color", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--pub_depth", action=argparse.BooleanOptionalAction, default=False)
-    ap.add_argument("--cam_color_hz", type=float, default=30.0)
-
-    ap.add_argument("--camera_left", default="camera_l")
-    ap.add_argument("--camera_right", default="camera_r")
-
-    ap.add_argument("--left_color_topic", default="/camera_l/color/image_raw")
-    ap.add_argument("--right_color_topic", default="/camera_r/color/image_raw")
-    ap.add_argument("--left_depth_topic", default="/camera_l/depth/image_raw")
-    ap.add_argument("--right_depth_topic", default="/camera_r/depth/image_raw")
-
-    # -------- ZED Mini publish (ZED-style topics) --------
-    ap.add_argument("--pub_zed", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--zed_camera_left", default="zed_mini_left")
-    ap.add_argument("--zed_camera_right", default="zed_mini_right")
-
-    ap.add_argument("--zed_left_color_topic",  default="/zed_mini/zed_node/left/image_rect_color")
-    ap.add_argument("--zed_right_color_topic", default="/zed_mini/zed_node/right/image_rect_color")
-    ap.add_argument("--zed_depth_topic",       default="/zed_mini/zed_node/depth/depth_registered")
     args = ap.parse_args()
+    mjcf_path = MODEL
+    max_world_boxes = max(0, int(args.max_world_boxes))
+    world_box_group = max(0, min(5, int(args.world_box_group)))
 
-    models_root = os.path.dirname(os.path.abspath(args.mjcf))
+    models_root = os.path.dirname(os.path.abspath(mjcf_path))
     _ensure_furniture_sim_paths(models_root)
 
-    model = mujoco.MjModel.from_xml_path(args.mjcf)
+    loaded_mjcf_path = _inject_world_box_slots(mjcf_path, max_world_boxes, world_box_group)
+
+    model = mujoco.MjModel.from_xml_path(loaded_mjcf_path)
     if model.nu <= 0:
         raise RuntimeError(
             "이 MJCF에는 actuator가 없습니다 (model.nu == 0). "
@@ -367,69 +541,64 @@ def main():
         raise RuntimeError("No hinge/slide joints found in MJCF. (mapping is empty)")
 
     cspace_joint_names = get_cspace_joint_names(args.robot_yml)
+    world_box_geom_ids = _find_world_box_geom_ids(model, max_world_boxes) if max_world_boxes > 0 else []
 
     print("=== MuJoCo spawn (CPU-friendly / kinematic) ===")
+    print(f"MJCF               : {mjcf_path}")
     print(f"No viewer          : {args.no_viewer}")
     print(f"Render hz          : {args.render_hz}")
     print(f"Idle render hz     : {args.idle_render_hz}")
     print(f"Render only moving : {args.render_only_when_moving}")
+    print(f"World collision topic : {args.world_collision_topic}")
+    print(f"World box slots       : {len(world_box_geom_ids)}")
+    print(f"World box group       : {world_box_group}")
+    print(f"World box rgba        : {args.world_box_rgba}")
+    print(f"World box physics col : {args.world_box_physics_collision}")
     print()
 
-    mujoco.mj_forward(model, data)
+    if not args.no_init_pose:
+        applied = apply_init_q_cspace(data, mapping, cspace_joint_names, args.init_q)
+        gripper_applied = apply_gripper_closed(
+            data,
+            mapping,
+            GRIPPER_CLOSED_JOINTS,
+            GRIPPER_CLOSED_VALUE,
+        )
+        mujoco.mj_forward(model, data)
+        print(f"[InitPose] applied {applied}/{len(cspace_joint_names)} joints")
+        print(f"[GripperInit] closed {gripper_applied}/{len(GRIPPER_CLOSED_JOINTS)} joints")
+    else:
+        gripper_applied = apply_gripper_closed(
+            data,
+            mapping,
+            GRIPPER_CLOSED_JOINTS,
+            GRIPPER_CLOSED_VALUE,
+        )
+        mujoco.mj_forward(model, data)
+        print("[InitPose] skipped")
+        print(f"[GripperInit] closed {gripper_applied}/{len(GRIPPER_CLOSED_JOINTS)} joints")
 
     act_names, joint_to_act = build_actuator_maps(model)
-
-    # ✅ 2) (init qpos가 반영된) 현재 자세를 목표로 ctrl_hold 구성
     ctrl_hold = make_ctrl_hold_from_qpos(model, data, act_names)
-
-    # ✅ 3) 시작부터 hold를 걸어둠
     data.ctrl[:] = ctrl_hold
 
     rclpy.init()
 
     last_ctrl_rx = 0
     last_ctrl = list(ctrl_hold)
+    last_world_rx = 0
 
-    cmd_node = JointCmdIO(args.sub_topic) 
+    cmd_node = JointCmdIO(args.sub_topic)
+    world_node = WorldCollisionIO(args.world_collision_topic) if world_box_geom_ids else None
 
-    # state publisher node
     state_node = Node("mujoco_state_pub")
     pub = state_node.create_publisher(JointState, args.pub_topic, 10)
     state_node.get_logger().info(f"Publishing MuJoCo state to: {args.pub_topic}")
 
-    # ---------------- Camera publishers (Image) ----------------
-    cam_color_pub_l = state_node.create_publisher(Image, args.left_color_topic, 10)
-    cam_color_pub_r = state_node.create_publisher(Image, args.right_color_topic, 10)
-    cam_depth_pub_l = state_node.create_publisher(Image, args.left_depth_topic, 10) if args.pub_depth else None
-    cam_depth_pub_r = state_node.create_publisher(Image, args.right_depth_topic, 10) if args.pub_depth else None
-
-    # MuJoCo renderer for offscreen camera rendering
-    # width/height: 필요하면 argument로 뺄 수 있음
-    cam_w, cam_h = 640, 480
-    # camera id lookup (by name)
-    cam_id_left = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, args.camera_left)
-    cam_id_right = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, args.camera_right)
-    if cam_id_left < 0:
-        state_node.get_logger().error(f"Left camera not found in MJCF: {args.camera_left}")
-    if cam_id_right < 0:
-        state_node.get_logger().error(f"Right camera not found in MJCF: {args.camera_right}")
-
-    # ---------------- ZED publishers (Image) ----------------
-    zed_color_pub_l = state_node.create_publisher(Image, args.zed_left_color_topic, 10) if args.pub_zed else None
-    zed_color_pub_r = state_node.create_publisher(Image, args.zed_right_color_topic, 10) if args.pub_zed else None
-    zed_depth_pub   = state_node.create_publisher(Image, args.zed_depth_topic, 10) if (args.pub_zed and args.pub_depth) else None
-
-    zed_cam_id_l = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, args.zed_camera_left)
-    zed_cam_id_r = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_CAMERA, args.zed_camera_right)
-
-    if args.pub_zed and zed_cam_id_l < 0:
-        state_node.get_logger().error(f"ZED LEFT camera not found in MJCF: {args.zed_camera_left}")
-    if args.pub_zed and zed_cam_id_r < 0:
-        state_node.get_logger().error(f"ZED RIGHT camera not found in MJCF: {args.zed_camera_right}")
-    
-    # executor 하나에 노드 둘 다 등록하고, spin은 스레드 1개만
     executor = SingleThreadedExecutor()
     executor.add_node(cmd_node)
+    if world_node is not None:
+        executor.add_node(world_node)
     executor.add_node(state_node)
 
     def _spin_exec():
@@ -440,7 +609,6 @@ def main():
 
     spin_thread = threading.Thread(target=_spin_exec, daemon=True)
     spin_thread.start()
-
 
     dt_update = _dt_from_hz(args.update_hz, 1.0 / 60.0)
     dt_pub = _dt_from_hz(args.pub_hz, 1.0 / 30.0)
@@ -453,24 +621,18 @@ def main():
     next_render = time.perf_counter()
     next_pub_wall = time.time()
     last_change_t = time.perf_counter()
-    dt_events = 1.0 / 30.0          # 이벤트 처리 30Hz면 충분
+    dt_events = 1.0 / 30.0
     next_events = time.perf_counter()
-    dt_cam = _dt_from_hz(args.cam_color_hz, 1.0 / 30.0)
-    next_cam_pub = time.perf_counter()
-
 
     viewer = None
     if not args.no_viewer:
         try:
             viewer = _make_mujoco_viewer(model, data)
             print("[VIEWER] created:", getattr(viewer, "window", None))
-            # viewer 만든 직후(초기 렌더 for-loop 전에) 추가
-            renderer = mujoco.Renderer(model, width=cam_w, height=cam_h)
         except Exception as e:
             print(f"[ERROR] viewer create failed: {e}")
             raise
 
-        # ✅ 창이 “확실히 뜨도록” 시작 시 강제로 몇 프레임 렌더
         for _ in range(3):
             try:
                 viewer.render()
@@ -480,7 +642,6 @@ def main():
                 print(f"[ERROR] initial render failed: {e}")
                 break
 
-        # ESC로 종료
         def _key_cb(window, key, scancode, action, mods):
             if action == glfw.PRESS and key == glfw.KEY_ESCAPE:
                 glfw.set_window_should_close(window, True)
@@ -494,17 +655,39 @@ def main():
         while rclpy.ok() and (viewer is None or _viewer_running(viewer)):
             now = time.perf_counter()
 
-            def publish_state(pub_node: Node, pub, joint_names_pub: List[str], q_list: List[float]):
+            if world_node is not None:
+                world_source, world_cuboids, world_rx = world_node.get_latest()
+                if world_rx != last_world_rx:
+                    last_world_rx = world_rx
+                    shown = apply_world_collision_boxes(
+                        model,
+                        data,
+                        world_box_geom_ids,
+                        world_cuboids,
+                        rgba=list(args.world_box_rgba),
+                        enable_physics_collision=bool(args.world_box_physics_collision),
+                    )
+                    if len(world_cuboids) > len(world_box_geom_ids):
+                        world_node.get_logger().warning(
+                            f"Received {len(world_cuboids)} world cuboids, "
+                            f"but only {len(world_box_geom_ids)} MuJoCo slots are available."
+                        )
+                    world_node.get_logger().info(
+                        f"Displayed {shown}/{len(world_cuboids)} world collision cuboid(s)"
+                        + (f" from {world_source}" if world_source else "")
+                    )
+                    last_change_t = time.perf_counter()
+                    next_render = last_change_t
+
+            def publish_state(pub_node: Node, state_pub, joint_names_pub: List[str], q_list: List[float]):
                 if len(q_list) != len(joint_names_pub):
                     return
                 msg = JointState()
                 msg.header.stamp = pub_node.get_clock().now().to_msg()
                 msg.name = list(joint_names_pub)
                 msg.position = list(q_list)
-                pub.publish(msg)
+                state_pub.publish(msg)
 
-
-            # --- update tick ---
             if now >= next_update:
                 if (now - next_update) > (3.0 * dt_update):
                     next_update = now + dt_update
@@ -513,24 +696,20 @@ def main():
 
                 cmd_dict, rx = cmd_node.get_latest()
 
-                # ✅ 새 JointState 명령이 오면: ctrl_hold를 베이스로 깔고, 들어온 joint만 덮어쓴 ctrl 벡터 생성
                 if rx != last_ctrl_rx:
                     last_ctrl_rx = rx
-                    last_ctrl = list(ctrl_hold)  # 기본은 init 유지
+                    last_ctrl = list(ctrl_hold)
 
-                    # drive(velocity) actuator는 항상 0 유지(원하면 JointState로도 속도명령 따로 처리 가능)
                     vel_act_names = {"left_wheel_drive_act", "right_wheel_drive_act", "rear_wheel_drive_act"}
 
                     for jn, q_des in cmd_dict.items():
                         a = joint_to_act.get(jn, None)
                         if a is None:
-                            continue  # 이 joint는 actuator가 없거나 이름 불일치
+                            continue
 
-                        # velocity actuator는 JointState로 위치명령 주면 의미 없으니 무시(=0 유지)
                         if act_names[a] in vel_act_names:
                             continue
 
-                        # ctrlrange clamp
                         if int(model.actuator_ctrllimited[a]) != 0:
                             lo = float(model.actuator_ctrlrange[a, 0])
                             hi = float(model.actuator_ctrlrange[a, 1])
@@ -539,11 +718,8 @@ def main():
 
                         last_ctrl[a] = float(q_des)
 
-                # ✅ 항상 last_ctrl로 구동 (한 번 명령 오면 계속 유지됨)
                 data.ctrl[:] = last_ctrl
 
-
-                # substep
                 dt_phys = float(model.opt.timestep)
                 steps = max(1, int(round(dt_update / max(1e-9, dt_phys))))
                 for _ in range(steps):
@@ -555,10 +731,8 @@ def main():
                 if now_wall >= next_pub_wall:
                     q_state = read_q_cspace_from_mujoco(data, mapping, cspace_joint_names)
                     publish_state(state_node, pub, cspace_joint_names, q_state)
-
                     next_pub_wall = now_wall + dt_pub
 
-            # --- cheap viewer events (throttled) ---
             if viewer is not None:
                 now_ev = time.perf_counter()
                 if now_ev >= next_events:
@@ -568,7 +742,6 @@ def main():
                         pass
                     next_events = now_ev + dt_events
 
-            # --- render tick (idle-aware) ---
             idle = (time.perf_counter() - last_change_t) > float(args.idle_after_s)
             if viewer is not None:
                 do_render = True
@@ -583,91 +756,25 @@ def main():
                         else:
                             next_render += dt_render
                         viewer.render()
-                        did_render = True
 
-            # --- camera publish tick (RealSense + ZED share same timing) ---
-            now_cam = time.perf_counter()
-            if now_cam >= next_cam_pub:
-                if (now_cam - next_cam_pub) > (3.0 * dt_cam):
-                    next_cam_pub = now_cam + dt_cam
-                else:
-                    next_cam_pub += dt_cam
-
-                # -------- RealSense-style cameras (camera_l / camera_r) --------
-                if args.pub_color and (cam_id_left >= 0) and (cam_id_right >= 0):
-                    renderer.update_scene(data, camera=cam_id_left)
-                    rgb_l = renderer.render()
-                    stamp = state_node.get_clock().now().to_msg()
-                    cam_color_pub_l.publish(_make_image_msg(rgb_l, stamp, args.camera_left))
-
-                    renderer.update_scene(data, camera=cam_id_right)
-                    rgb_r = renderer.render()
-                    stamp = state_node.get_clock().now().to_msg()
-                    cam_color_pub_r.publish(_make_image_msg(rgb_r, stamp, args.camera_right))
-
-                    if args.pub_depth and (cam_depth_pub_l is not None) and (cam_depth_pub_r is not None):
-                        renderer.update_scene(data, camera=cam_id_left)
-                        depth_l = renderer.render(depth=True)
-                        stamp = state_node.get_clock().now().to_msg()
-                        cam_depth_pub_l.publish(_make_depth32_msg(depth_l.astype("float32"), stamp, args.camera_left))
-
-                        renderer.update_scene(data, camera=cam_id_right)
-                        depth_r = renderer.render(depth=True)
-                        stamp = state_node.get_clock().now().to_msg()
-                        cam_depth_pub_r.publish(_make_depth32_msg(depth_r.astype("float32"), stamp, args.camera_right))
-
-                # -------- ZED stereo cameras (zed_mini_left / zed_mini_right) --------
-                if args.pub_zed and (zed_cam_id_l >= 0) and (zed_cam_id_r >= 0) and (zed_color_pub_l is not None) and (zed_color_pub_r is not None):
-                    # left
-                    renderer.update_scene(data, camera=zed_cam_id_l)
-                    zed_rgb_l = renderer.render()
-                    stamp = state_node.get_clock().now().to_msg()
-                    zed_color_pub_l.publish(_make_image_msg(zed_rgb_l, stamp, args.zed_camera_left))
-
-                    # right
-                    renderer.update_scene(data, camera=zed_cam_id_r)
-                    zed_rgb_r = renderer.render()
-                    stamp = state_node.get_clock().now().to_msg()
-                    zed_color_pub_r.publish(_make_image_msg(zed_rgb_r, stamp, args.zed_camera_right))
-
-                    # depth (옵션: left 기준 depth)
-                    if args.pub_depth and (zed_depth_pub is not None):
-                        renderer.update_scene(data, camera=zed_cam_id_l)
-                        zed_depth = renderer.render(depth=True)
-                        stamp = state_node.get_clock().now().to_msg()
-                        zed_depth_pub.publish(_make_depth32_msg(zed_depth.astype("float32"), stamp, args.zed_camera_left))
-
-                # ✅ 컨텍스트 복구: viewer가 검게 되는 문제 방지 (한 번만)
-                if viewer is not None:
-                    try:
-                        glfw.make_context_current(viewer.window)
-                    except Exception:
-                        pass
-
-            # --- sleep (avoid busy loop) ---
             now2 = time.perf_counter()
-
             targets = [next_update]
 
             if viewer is not None:
-                # 렌더 예정이 있으면 그 시각도 타겟에 포함
                 idle = (time.perf_counter() - last_change_t) > float(args.idle_after_s)
                 do_render = not (args.render_only_when_moving and idle and not (args.idle_render_hz > 0.0))
                 if do_render:
                     targets.append(next_render)
-                # 이벤트 처리 타이밍도 포함(너무 늦게 처리하면 창이 뻑뻑해짐)
                 targets.append(next_events)
 
             sleep_until = min(targets)
             sleep_time = sleep_until - now2
 
             if viewer is not None:
-                # idle 렌더를 안 하는 경우: wait_events_timeout으로 CPU 사용 최소화 + 창 응답 유지
                 if sleep_time > 0:
                     idle = (time.perf_counter() - last_change_t) > float(args.idle_after_s)
                     do_render = not (args.render_only_when_moving and idle and not (args.idle_render_hz > 0.0))
                     if not do_render:
-                        # 이벤트가 오면 즉시 깨어남
                         try:
                             glfw.wait_events_timeout(min(0.2, max(0.0, sleep_time)))
                         except Exception:
@@ -682,25 +789,24 @@ def main():
                 else:
                     time.sleep(min_sleep)
 
-
     finally:
-        try:
-            renderer.close()
-        except Exception:
-            pass
         try:
             if viewer is not None:
                 viewer.close()
         except Exception:
             pass
 
-        # executor / nodes 정리
         try:
             if executor is not None:
                 try:
-                    executor.remove_node(cmd_node)     # ✅ ctrl_node -> cmd_node
+                    executor.remove_node(cmd_node)
                 except Exception:
                     pass
+                if world_node is not None:
+                    try:
+                        executor.remove_node(world_node)
+                    except Exception:
+                        pass
                 try:
                     executor.remove_node(state_node)
                 except Exception:
@@ -712,6 +818,11 @@ def main():
             cmd_node.destroy_node()
         except Exception:
             pass
+        if world_node is not None:
+            try:
+                world_node.destroy_node()
+            except Exception:
+                pass
         try:
             state_node.destroy_node()
         except Exception:
@@ -722,7 +833,11 @@ def main():
         except Exception:
             pass
 
-
+        if loaded_mjcf_path != mjcf_path:
+            try:
+                os.unlink(loaded_mjcf_path)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

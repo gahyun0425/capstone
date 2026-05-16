@@ -6,10 +6,19 @@ ROBOT_XML = "/home/gaga/capstone_ws/src/capstone_pkg/models/ffw_sg2.xml"
 ROBOT_URDF = "/home/gaga/capstone_ws/src/capstone_pkg/models/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
 ROBOT_YAML = "/home/gaga/capstone_ws/src/capstone_pkg/models/test_curobo.yaml"
 WORLD_YAML = "/home/gaga/capstone_ws/src/capstone_pkg/models/world_collision.yaml"
+SHELF_YAML = "/home/gaga/capstone_ws/src/capstone_pkg/models/shelf_collision.yaml"
+LONG_SHELF_YAML = "/home/gaga/capstone_ws/src/capstone_pkg/models/long_shelf_collision.yaml"
+CART_YAML = "/home/gaga/capstone_ws/src/capstone_pkg/models/cart_collision.yaml"
+
+
 
 BASE_FRAME = "base_link"
-LEFT_EE_FRAME  = "gripper_l_rh_p12_rn_base"
-RIGHT_EE_FRAME = "gripper_r_rh_p12_rn_base"
+# LEFT_EE_FRAME  = "gripper_l_rh_p12_rn_base"
+# RIGHT_EE_FRAME = "gripper_r_rh_p12_rn_base"
+
+LEFT_EE_FRAME = "gripper_l_tcp"
+RIGHT_EE_FRAME = "gripper_r_tcp"
+
 
 LEFT_PREFIX  = "arm_l_joint"
 RIGHT_PREFIX = "arm_r_joint"
@@ -39,6 +48,8 @@ RIGHT_JOINTS = [
 JOINT_LIMIT = "/home/gaga/capstone_ws/src/capstone_pkg/models/joint_limits.yaml"
 DEFAULT_ROBOT_YAML = ROBOT_YAML
 DEFAULT_WORLD_YAML = WORLD_YAML
+DEFAULT_SHELF_YAML = SHELF_YAML
+DEFAULT_CART_YAML = CART_YAML
 DEFAULT_JOINT_LIMIT = JOINT_LIMIT
 DEFAULT_MODEL = ROBOT_XML
 LEFT_GRIPPER = LEFT_EE_FRAME
@@ -46,5 +57,8 @@ RIGHT_GRIPPER = RIGHT_EE_FRAME
 CSPACE_JOINT_NAMES_14 = LEFT_JOINTS + RIGHT_JOINTS
 ROBOT_YAML_STR = str(ROBOT_YAML)
 WORLD_YAML_STR = str(WORLD_YAML)
+SHELF_YAML_STR = str(SHELF_YAML)
+LONG_SHELF_YAML_STR = str(LONG_SHELF_YAML)
+CART_YAML_STR = str(CART_YAML)
 JOINT_LIMIT_STR = str(JOINT_LIMIT)
 MODEL_STR = str(ROBOT_XML)

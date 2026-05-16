@@ -196,6 +196,17 @@ class BimanualFKRobotWorld:
 
     @torch.no_grad()
     def fk_left_pose(self, q_cspace: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if q_cspace.dim() == 2 and q_cspace.shape[0] > 1 and self.device.type == "cuda":
+            # cuRobo RobotWorld batched FK can hit illegal memory access here for
+            # planar cart planning, so keep the CUDA path to single-sample FK.
+            pos_rows = []
+            quat_rows = []
+            for row in q_cspace:
+                p_row, q_row = self.fk_left_pose(row)
+                pos_rows.append(p_row)
+                quat_rows.append(q_row)
+            return torch.cat(pos_rows, dim=0), torch.cat(quat_rows, dim=0)
+
         q_model_L = self._cspace_to_model_fast(
             q_cspace=q_cspace,
             Dmodel=len(self.model_names_L),
@@ -207,6 +218,15 @@ class BimanualFKRobotWorld:
 
     @torch.no_grad()
     def fk_right_pose(self, q_cspace: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        if q_cspace.dim() == 2 and q_cspace.shape[0] > 1 and self.device.type == "cuda":
+            pos_rows = []
+            quat_rows = []
+            for row in q_cspace:
+                p_row, q_row = self.fk_right_pose(row)
+                pos_rows.append(p_row)
+                quat_rows.append(q_row)
+            return torch.cat(pos_rows, dim=0), torch.cat(quat_rows, dim=0)
+
         q_model_R = self._cspace_to_model_fast(
             q_cspace=q_cspace,
             Dmodel=len(self.model_names_R),

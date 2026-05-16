@@ -21,6 +21,8 @@ class PlanStats:
     ts_count: int
     time_sec: float
     extra: Dict[str, Any]
+    smoothing_time_sec: float = 0.0
+    total_time_sec: Optional[float] = None
 
 
 @dataclass

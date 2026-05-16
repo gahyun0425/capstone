@@ -97,7 +97,7 @@
       <joint frictionloss="0.1" armature="0.5" damping="30.0" />
       <position kp="600" dampratio="1" forcerange="-61.4 61.4" />
       <default class="arm_l_joint1">
-        <joint axis="0 -1 0" range="-3.14 3.14" />
+        <joint axis="0 1 0" range="-3.14 3.14" />
         </default>
       <default class="arm_l_joint2">
         <joint axis="1 0 0" range="0 3.14" />

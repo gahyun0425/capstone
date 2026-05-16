@@ -1,7 +1,7 @@
 robot_cfg:
   kinematics:
     urdf_path: "/home/gaga/capstone_ws/src/capstone_pkg/models/urdf/ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
-    asset_root_path: /home/gaga/capstone_ws/src/capstone_pkg/models/urdf/ffw_sg2_rev1_follower
+    asset_root_path: /home/gaga/capstone_ws/src/capstone_pkg/models
 
     base_link: base_link
     ee_link: gripper_l_rh_p12_rn_base
@@ -36,6 +36,7 @@ robot_cfg:
       - gripper_r_rh_p12_rn_r2
       - gripper_r_rh_p12_rn_l1
       - gripper_r_rh_p12_rn_l2
+      # - lift_link
 
     lock_joints:
       lift_joint: 0.0
