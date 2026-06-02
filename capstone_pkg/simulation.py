@@ -22,8 +22,10 @@ from capstone_pkg.utils.world_collision_bridge import (
     WorldCuboid,
     parse_world_collision_payload,
 )
+from control_msgs.action import FollowJointTrajectory
 from curobo.util_file import load_yaml
-from rclpy.executors import SingleThreadedExecutor
+from rclpy.action import ActionServer, CancelResponse, GoalResponse
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import QoSDurabilityPolicy, QoSProfile, QoSReliabilityPolicy
 from sensor_msgs.msg import JointState
@@ -308,6 +310,196 @@ class WorldCollisionIO(Node):
             return self._latest_source, list(self._latest), int(self._rx)
 
 
+class LiftTrajectoryActionIO(Node):
+    def __init__(
+        self,
+        action_name: str,
+        joint_name: str,
+        *,
+        actuator_available: bool,
+        goal_tolerance: float,
+        timeout_margin_s: float,
+    ):
+        super().__init__("mujoco_lift_action_io")
+        self._action_name = str(action_name)
+        self._joint_name = str(joint_name)
+        self._actuator_available = bool(actuator_available)
+        self._goal_tolerance = max(1e-4, float(goal_tolerance))
+        self._timeout_margin_s = max(0.0, float(timeout_margin_s))
+
+        self._lock = threading.Lock()
+        self._done_event = threading.Event()
+        self._goal_handle = None
+        self._target_position: float | None = None
+        self._deadline_monotonic = 0.0
+        self._terminal_state: str | None = None
+        self._result_error_code = FollowJointTrajectory.Result.SUCCESSFUL
+        self._result_error_string = ""
+        self._cancel_requested = False
+
+        self._action_server = ActionServer(
+            self,
+            FollowJointTrajectory,
+            self._action_name,
+            execute_callback=self._execute_callback,
+            goal_callback=self._goal_callback,
+            cancel_callback=self._cancel_callback,
+        )
+        avail = "available" if self._actuator_available else "missing actuator"
+        self.get_logger().info(
+            f"Serving lift FollowJointTrajectory on {self._action_name} "
+            f"(joint={self._joint_name}, {avail})"
+        )
+
+    def destroy_node(self):
+        try:
+            self._action_server.destroy()
+        except Exception:
+            pass
+        return super().destroy_node()
+
+    def _parse_goal(
+        self,
+        goal: FollowJointTrajectory.Goal,
+    ) -> Tuple[bool, float, float, str]:
+        if not self._actuator_available:
+            return False, 0.0, 0.0, f"Actuator for {self._joint_name} is not available in MuJoCo model"
+
+        joint_names = list(goal.trajectory.joint_names)
+        if self._joint_name not in joint_names:
+            return False, 0.0, 0.0, f"trajectory.joint_names must include {self._joint_name}"
+
+        if not goal.trajectory.points:
+            return False, 0.0, 0.0, "trajectory.points is empty"
+
+        joint_idx = joint_names.index(self._joint_name)
+        final_point = goal.trajectory.points[-1]
+        if joint_idx >= len(final_point.positions):
+            return False, 0.0, 0.0, f"final point is missing position for {self._joint_name}"
+
+        duration = float(final_point.time_from_start.sec) + (
+            float(final_point.time_from_start.nanosec) * 1e-9
+        )
+        target_position = float(final_point.positions[joint_idx])
+        return True, target_position, max(0.0, duration), ""
+
+    def _goal_callback(self, goal_request: FollowJointTrajectory.Goal) -> GoalResponse:
+        ok, _, _, reason = self._parse_goal(goal_request)
+        if not ok:
+            self.get_logger().warning(f"Rejecting lift trajectory goal: {reason}")
+            return GoalResponse.REJECT
+
+        with self._lock:
+            if self._goal_handle is not None and self._terminal_state is None:
+                self.get_logger().warning("Rejecting lift trajectory goal: another goal is active")
+                return GoalResponse.REJECT
+        return GoalResponse.ACCEPT
+
+    def _cancel_callback(self, goal_handle) -> CancelResponse:
+        with self._lock:
+            if self._goal_handle is goal_handle and self._terminal_state is None:
+                self._cancel_requested = True
+                self._terminal_state = "canceled"
+                self._result_error_code = FollowJointTrajectory.Result.SUCCESSFUL
+                self._result_error_string = "Goal canceled"
+                self._done_event.set()
+        return CancelResponse.ACCEPT
+
+    def _execute_callback(self, goal_handle):
+        ok, target_position, duration_s, reason = self._parse_goal(goal_handle.request)
+        if not ok:
+            result = FollowJointTrajectory.Result()
+            result.error_code = FollowJointTrajectory.Result.INVALID_GOAL
+            result.error_string = reason
+            goal_handle.abort()
+            return result
+
+        with self._lock:
+            self._goal_handle = goal_handle
+            self._target_position = target_position
+            self._deadline_monotonic = time.perf_counter() + duration_s + self._timeout_margin_s
+            self._terminal_state = None
+            self._result_error_code = FollowJointTrajectory.Result.SUCCESSFUL
+            self._result_error_string = ""
+            self._cancel_requested = False
+            self._done_event.clear()
+
+        self.get_logger().info(
+            f"[lift_action] accepted goal: joint={self._joint_name}, "
+            f"target={target_position:.3f}, duration={duration_s:.3f}s"
+        )
+
+        self._done_event.wait()
+
+        with self._lock:
+            terminal_state = self._terminal_state or "aborted"
+            error_code = int(self._result_error_code)
+            error_string = str(self._result_error_string)
+            self._goal_handle = None
+            self._target_position = None
+            self._deadline_monotonic = 0.0
+            self._terminal_state = None
+            self._cancel_requested = False
+            self._done_event.clear()
+
+        result = FollowJointTrajectory.Result()
+        result.error_code = error_code
+        result.error_string = error_string
+
+        if terminal_state == "succeeded":
+            goal_handle.succeed()
+        elif terminal_state == "canceled":
+            goal_handle.canceled()
+        else:
+            goal_handle.abort()
+
+        return result
+
+    def get_active_target_position(self) -> float | None:
+        with self._lock:
+            if self._goal_handle is None or self._terminal_state is not None:
+                return None
+            return self._target_position
+
+    def update_from_sim(self, current_position: float) -> None:
+        should_finish = False
+        with self._lock:
+            if self._goal_handle is None or self._terminal_state is not None:
+                return
+
+            if self._cancel_requested:
+                self._terminal_state = "canceled"
+                self._result_error_code = FollowJointTrajectory.Result.SUCCESSFUL
+                self._result_error_string = "Goal canceled"
+                should_finish = True
+            else:
+                target = self._target_position
+                if target is None:
+                    self._terminal_state = "aborted"
+                    self._result_error_code = FollowJointTrajectory.Result.INVALID_GOAL
+                    self._result_error_string = "Internal error: missing lift target"
+                    should_finish = True
+                else:
+                    err = abs(float(current_position) - float(target))
+                    if err <= self._goal_tolerance:
+                        self._terminal_state = "succeeded"
+                        self._result_error_code = FollowJointTrajectory.Result.SUCCESSFUL
+                        self._result_error_string = ""
+                        should_finish = True
+                    elif time.perf_counter() >= self._deadline_monotonic:
+                        self._terminal_state = "aborted"
+                        self._result_error_code = FollowJointTrajectory.Result.GOAL_TOLERANCE_VIOLATED
+                        self._result_error_string = (
+                            f"{self._joint_name} did not reach target. "
+                            f"target={float(target):.4f}, current={float(current_position):.4f}, "
+                            f"tol={self._goal_tolerance:.4f}"
+                        )
+                        should_finish = True
+
+        if should_finish:
+            self._done_event.set()
+
+
 class JointStateIO(Node):
     def __init__(self, sub_topic: str, pub_topic: str, joint_names_pub: List[str]):
         super().__init__("mujoco_jointstate_io")
@@ -401,10 +593,10 @@ def apply_jointstate_qpos(
 def read_q_cspace_from_mujoco(
     data: mujoco.MjData,
     mapping: Dict[str, int],
-    cspace_joint_names: List[str],
+    joint_names: List[str],
 ) -> List[float]:
     out: List[float] = []
-    for jn in cspace_joint_names:
+    for jn in joint_names:
         adr = mapping.get(jn, None)
         if adr is None or not (0 <= adr < data.qpos.size):
             out.append(0.0)
@@ -517,6 +709,10 @@ def main():
     ap.add_argument("--world_box_group", type=int, default=0)
     ap.add_argument("--world_box_rgba", nargs=4, type=float, default=[0.95, 0.20, 0.05, 0.65])
     ap.add_argument("--world_box_physics_collision", action=argparse.BooleanOptionalAction, default=False)
+    ap.add_argument("--lift_action_name", default="/lift_controller/follow_joint_trajectory")
+    ap.add_argument("--lift_action_joint_name", default="lift_joint")
+    ap.add_argument("--lift_action_goal_tolerance", type=float, default=0.02)
+    ap.add_argument("--lift_action_timeout_margin_s", type=float, default=5.0)
 
     args = ap.parse_args()
     mjcf_path = MODEL
@@ -541,6 +737,10 @@ def main():
         raise RuntimeError("No hinge/slide joints found in MJCF. (mapping is empty)")
 
     cspace_joint_names = get_cspace_joint_names(args.robot_yml)
+    joint_names_pub = list(cspace_joint_names)
+    if "lift_joint" in mapping and "lift_joint" not in joint_names_pub:
+        joint_names_pub.append("lift_joint")
+        print("[JointStatePub] added lift_joint to published /joint_states")
     world_box_geom_ids = _find_world_box_geom_ids(model, max_world_boxes) if max_world_boxes > 0 else []
 
     print("=== MuJoCo spawn (CPU-friendly / kinematic) ===")
@@ -590,15 +790,23 @@ def main():
 
     cmd_node = JointCmdIO(args.sub_topic)
     world_node = WorldCollisionIO(args.world_collision_topic) if world_box_geom_ids else None
+    lift_action_node = LiftTrajectoryActionIO(
+        args.lift_action_name,
+        args.lift_action_joint_name,
+        actuator_available=args.lift_action_joint_name in joint_to_act,
+        goal_tolerance=args.lift_action_goal_tolerance,
+        timeout_margin_s=args.lift_action_timeout_margin_s,
+    )
 
     state_node = Node("mujoco_state_pub")
     pub = state_node.create_publisher(JointState, args.pub_topic, 10)
     state_node.get_logger().info(f"Publishing MuJoCo state to: {args.pub_topic}")
 
-    executor = SingleThreadedExecutor()
+    executor = MultiThreadedExecutor(num_threads=3)
     executor.add_node(cmd_node)
     if world_node is not None:
         executor.add_node(world_node)
+    executor.add_node(lift_action_node)
     executor.add_node(state_node)
 
     def _spin_exec():
@@ -698,7 +906,6 @@ def main():
 
                 if rx != last_ctrl_rx:
                     last_ctrl_rx = rx
-                    last_ctrl = list(ctrl_hold)
 
                     vel_act_names = {"left_wheel_drive_act", "right_wheel_drive_act", "rear_wheel_drive_act"}
 
@@ -718,6 +925,17 @@ def main():
 
                         last_ctrl[a] = float(q_des)
 
+                lift_target = lift_action_node.get_active_target_position()
+                if lift_target is not None:
+                    lift_act = joint_to_act.get(args.lift_action_joint_name, None)
+                    if lift_act is not None:
+                        if int(model.actuator_ctrllimited[lift_act]) != 0:
+                            lo = float(model.actuator_ctrlrange[lift_act, 0])
+                            hi = float(model.actuator_ctrlrange[lift_act, 1])
+                            if hi > lo:
+                                lift_target = max(lo, min(hi, float(lift_target)))
+                        last_ctrl[lift_act] = float(lift_target)
+
                 data.ctrl[:] = last_ctrl
 
                 dt_phys = float(model.opt.timestep)
@@ -725,12 +943,16 @@ def main():
                 for _ in range(steps):
                     mujoco.mj_step(model, data)
 
+                lift_adr = mapping.get(args.lift_action_joint_name, None)
+                if lift_adr is not None and 0 <= lift_adr < data.qpos.size:
+                    lift_action_node.update_from_sim(float(data.qpos[lift_adr]))
+
                 last_change_t = time.perf_counter()
 
                 now_wall = time.time()
                 if now_wall >= next_pub_wall:
-                    q_state = read_q_cspace_from_mujoco(data, mapping, cspace_joint_names)
-                    publish_state(state_node, pub, cspace_joint_names, q_state)
+                    q_state = read_q_cspace_from_mujoco(data, mapping, joint_names_pub)
+                    publish_state(state_node, pub, joint_names_pub, q_state)
                     next_pub_wall = now_wall + dt_pub
 
             if viewer is not None:
@@ -808,6 +1030,10 @@ def main():
                     except Exception:
                         pass
                 try:
+                    executor.remove_node(lift_action_node)
+                except Exception:
+                    pass
+                try:
                     executor.remove_node(state_node)
                 except Exception:
                     pass
@@ -823,6 +1049,10 @@ def main():
                 world_node.destroy_node()
             except Exception:
                 pass
+        try:
+            lift_action_node.destroy_node()
+        except Exception:
+            pass
         try:
             state_node.destroy_node()
         except Exception:

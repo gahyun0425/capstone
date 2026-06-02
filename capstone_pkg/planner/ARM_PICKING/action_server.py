@@ -13,7 +13,7 @@ from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool, String
+from std_msgs.msg import Bool
 
 from grasp_msgs.msg import ObjectAlign, ObjectGrasp
 from capstone_pkg.planner.arm_rrt_common.path_publisher import (
@@ -74,10 +74,15 @@ _SHELF_1_ALIGN_QUATERNION_XYZW = (
     0.0,
     0.0,
 )
+_SHELF_1_ALIGN_FIXED_X_M = 0.5
 _SHELF_1_ALIGN_FIXED_Z_M = 1.2
 _GRASP_OBJECT_POSE_X_OFFSET_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_X_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.0
+_SHELF_1_GRASP_COLLISION_OBJECT_SIZE_Z_OFFSET_M = 0.0
+_MIN_GRASP_COLLISION_OBJECT_SIZE_M = 0.001
+_SHELF_1_POST_GRASP_RAISE_Z_M = 0.30
+_SHELF_2_POST_GRASP_RAISE_Z_M = 0.05
 _PREFERRED_GRASP_QUATERNION_XYZW = (
     0.7071067811865475,
     5.551115123125783e-17,
@@ -86,6 +91,7 @@ _PREFERRED_GRASP_QUATERNION_XYZW = (
 )
 _GRASP_IK_CANDIDATE_BATCH_SIZE = 3
 _GRASP_FALLBACK_Z_OFFSET_M = 0.03
+_GRASP_FALLBACK_X_OFFSET_M = -0.015
 _ZERO_JOINT_TOL = 1.0e-4
 
 
@@ -173,7 +179,7 @@ def _build_align_target_pose(
     pose = Pose()
     shelf_type = str(msg.shelf_type).strip().lower()
     if shelf_type == "shelf_1":
-        pose.position.x = float(msg.marker_position.x)
+        pose.position.x = float(_SHELF_1_ALIGN_FIXED_X_M)
         pose.position.y = float(msg.marker_position.y)
         pose.position.z = float(_SHELF_1_ALIGN_FIXED_Z_M)
     else:
@@ -564,7 +570,6 @@ class ArmPickingCoordinator(Node):
         self._latest_grasp_msg: ObjectGrasp | None = None
         self._latest_grasp_seq = 0
         self._gripper_finish_cv = threading.Condition()
-        self._latest_gripper_finish_arm = ""
         self._latest_gripper_finish_seq = 0
 
         self._run_startup_warmup()
@@ -582,12 +587,12 @@ class ArmPickingCoordinator(Node):
             self.qos_cmd,
         )
         self._gripper_finish_sub = self.create_subscription(
-            String,
+            Bool,
             str(args.gripper_finish_topic),
             self._on_gripper_finish,
             self.qos_cmd,
         )
-        self._gripper_start_pub = self.create_publisher(String, str(args.gripper_start_topic), 10)
+        self._gripper_start_pub = self.create_publisher(Bool, str(args.gripper_start_topic), 10)
         self._arm_picking_finish_pub = self.create_publisher(
             Bool,
             str(args.arm_picking_finish_topic),
@@ -707,19 +712,15 @@ class ArmPickingCoordinator(Node):
             f"Received ObjectGrasp for arm={arm} label={label!r}"
         )
 
-    def _on_gripper_finish(self, msg: String) -> None:
-        arm_raw = str(msg.data).strip().lower()
-        try:
-            arm = normalize_arm_name(arm_raw)
-        except ValueError:
-            self.get_logger().warning(f"Ignoring gripper_finish with invalid arm={arm_raw!r}")
+    def _on_gripper_finish(self, msg: Bool) -> None:
+        if not bool(msg.data):
+            self.get_logger().info("Ignoring gripper_finish=False")
             return
 
         with self._gripper_finish_cv:
-            self._latest_gripper_finish_arm = arm
             self._latest_gripper_finish_seq += 1
             self._gripper_finish_cv.notify_all()
-        self.get_logger().info(f"Received gripper_finish for arm={arm}")
+        self.get_logger().info("Received gripper_finish=True")
 
     def _resolve_world_yml_from_msg(self, msg: ObjectAlign) -> str | None:
         shelf_type = str(msg.shelf_type).strip()
@@ -1030,6 +1031,7 @@ class ArmPickingCoordinator(Node):
         arm: str,
         grasp_msg: ObjectGrasp,
         world_yml: str | None,
+        allow_object_center_fallback: bool = True,
     ) -> tuple[GraspIKSelection, list[float]]:
         q_start_cspace = self._resolve_grasp_q_start_cspace(
             arm=arm,
@@ -1065,20 +1067,39 @@ class ArmPickingCoordinator(Node):
                     f"target_quat_xyzw={_pose_orientation_xyzw(selection.pose)}"
                 )
                 return selection, q_start_cspace
+            if not bool(allow_object_center_fallback):
+                raise RuntimeError("IK failed for all grasp candidates")
             self.get_logger().warning(
                 "[GRASP IK] no valid IK from grasp candidates; falling back to object center pose."
             )
         else:
+            if not bool(allow_object_center_fallback):
+                raise RuntimeError("No grasp candidates in message")
             self.get_logger().warning(
                 "[GRASP IK] no grasp candidates in message; falling back to object center pose."
             )
 
         fallback_attempts = (
-            ("object_center", _build_object_center_fallback_pose(grasp_msg)),
             (
                 f"object_center_z_plus_{_GRASP_FALLBACK_Z_OFFSET_M:.3f}",
                 _build_object_center_fallback_pose(
                     grasp_msg,
+                    z_offset_m=float(_GRASP_FALLBACK_Z_OFFSET_M),
+                ),
+            ),
+            (
+                f"object_center_x_minus_{abs(_GRASP_FALLBACK_X_OFFSET_M):.3f}",
+                _build_object_center_fallback_pose(
+                    grasp_msg,
+                    x_offset_m=float(_GRASP_FALLBACK_X_OFFSET_M),
+                ),
+            ),
+            (
+                "object_center_z_plus_"
+                f"{_GRASP_FALLBACK_Z_OFFSET_M:.3f}_x_minus_{abs(_GRASP_FALLBACK_X_OFFSET_M):.3f}",
+                _build_object_center_fallback_pose(
+                    grasp_msg,
+                    x_offset_m=float(_GRASP_FALLBACK_X_OFFSET_M),
                     z_offset_m=float(_GRASP_FALLBACK_Z_OFFSET_M),
                 ),
             ),
@@ -1594,10 +1615,7 @@ class ArmPickingCoordinator(Node):
         deadline = None if timeout_s < 0.0 else time.monotonic() + float(timeout_s)
         with self._gripper_finish_cv:
             while True:
-                if (
-                    self._latest_gripper_finish_seq > int(min_seq)
-                    and self._latest_gripper_finish_arm == normalized_arm
-                ):
+                if self._latest_gripper_finish_seq > int(min_seq):
                     return
                 if deadline is not None:
                     remaining = deadline - time.monotonic()
@@ -1900,10 +1918,11 @@ class ArmPickingCoordinator(Node):
         self.get_logger().info(f"Saved ARM_PICKING align sequence to {save_path}")
 
     def _publish_gripper_start(self, arm: str) -> None:
-        msg = String()
-        msg.data = normalize_arm_name(arm)
+        normalized_arm = normalize_arm_name(arm)
+        msg = Bool()
+        msg.data = True
         self._gripper_start_pub.publish(msg)
-        self.get_logger().info(f"Published gripper_start for arm={msg.data}")
+        self.get_logger().info(f"Published gripper_start=True for arm={normalized_arm}")
 
     def _publish_arm_picking_finish(self, arm: str, *, stage: str) -> None:
         msg = Bool()
@@ -1925,7 +1944,11 @@ class ArmPickingCoordinator(Node):
         *,
         selected_arm: str,
         base_world_yml: str | None,
+        shelf_type: str,
     ) -> None:
+        shelf_type_key = str(shelf_type).strip().lower()
+        is_shelf_1 = shelf_type_key == "shelf_1"
+        is_shelf_2 = shelf_type_key == "shelf_2"
         grasp_seq = int(self._latest_grasp_seq)
         grasp_attempt = 0
         while True:
@@ -1942,6 +1965,11 @@ class ArmPickingCoordinator(Node):
                 object_size = _copy_vector3(grasp_msg.object_size)
                 object_size.x = float(_GRASP_COLLISION_OBJECT_SIZE_X_M)
                 object_size.y = float(object_size.y) - float(_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M)
+                if is_shelf_1:
+                    object_size.z = max(
+                        float(_MIN_GRASP_COLLISION_OBJECT_SIZE_M),
+                        float(object_size.z) - float(_SHELF_1_GRASP_COLLISION_OBJECT_SIZE_Z_OFFSET_M),
+                    )
                 object_label = str(getattr(grasp_msg, "label", "")).strip()
                 object_world_yml = _merge_world_with_user_object(
                     base_world_yml,
@@ -1960,6 +1988,7 @@ class ArmPickingCoordinator(Node):
                     arm=selected_arm,
                     grasp_msg=grasp_msg,
                     world_yml=object_world_yml,
+                    allow_object_center_fallback=not is_shelf_1,
                 )
                 grasp_target_pose = _copy_pose(grasp_selection.pose)
                 grasp_plan = self._plan_selected_arm_to_q_goal(
@@ -1978,6 +2007,48 @@ class ArmPickingCoordinator(Node):
                     min_seq=gripper_finish_seq,
                     timeout_s=float(self._args.gripper_finish_wait_s),
                 )
+
+                if is_shelf_1 or is_shelf_2:
+                    raise_z_m = (
+                        float(_SHELF_1_POST_GRASP_RAISE_Z_M)
+                        if is_shelf_1
+                        else float(_SHELF_2_POST_GRASP_RAISE_Z_M)
+                    )
+                    raise_pose = _offset_pose_z(grasp_target_pose, raise_z_m)
+                    raise_plan = self._plan_selected_arm(
+                        stage="post_grasp_raise",
+                        arm=selected_arm,
+                        target_pose=raise_pose,
+                        world_yml=object_world_yml,
+                        q_start_cspace=grasp_plan.q_goal_cspace,
+                    )
+                    self._wait_for_single_arm(stage="post_grasp_raise", plan=raise_plan)
+
+                    if is_shelf_2:
+                        retreat_pose = _build_post_grasp_staging_pose(selected_arm, raise_pose)
+                        retreat_plan = self._plan_selected_arm_fixed_ee_z(
+                            stage="retreat",
+                            arm=selected_arm,
+                            target_pose=retreat_pose,
+                            world_yml=object_world_yml,
+                            q_start_cspace=raise_plan.q_goal_cspace,
+                        )
+                        self._wait_for_single_arm(stage="retreat", plan=retreat_plan)
+
+                    self.get_logger().info(
+                        f"[ARM_PICKING] {shelf_type_key} grasp completed: "
+                        f"post_grasp_raise_z_m={raise_z_m:.3f} "
+                        f"retreat={'yes' if is_shelf_2 else 'no'}"
+                    )
+                    self.get_logger().info(
+                        "[ARM_PICKING] grasp sequence completed: "
+                        f"label={object_label!r} "
+                        f"grasp_source={grasp_selection.source} "
+                        f"arm={selected_arm} object_center={_pose_position_xyz(object_pose)} "
+                        f"object_size={_vector3_xyz(object_size)}"
+                    )
+                    self._publish_arm_picking_finish_after_motion_complete(selected_arm, stage="grasp")
+                    return
 
                 lift_pose = _offset_pose_z(grasp_target_pose, float(self._args.post_grasp_lift_z_m))
                 lift_plan = self._plan_selected_arm(
@@ -2080,6 +2151,7 @@ class ArmPickingCoordinator(Node):
             self._execute_grasp_sequence(
                 selected_arm=selected_arm,
                 base_world_yml=world_yml,
+                shelf_type=str(msg.shelf_type).strip(),
             )
         except Exception as exc:
             self.get_logger().error(f"ARM_PICKING align sequence failed: {exc}")
@@ -2112,12 +2184,12 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
     parser.add_argument(
         "--gripper_start_topic",
         default="/gripper_start",
-        help="topic name used to notify gripper start for the selected arm",
+        help="topic name used to publish gripper start as Bool(True)",
     )
     parser.add_argument(
         "--gripper_finish_topic",
         default="/gripper_finish",
-        help="topic name used to receive gripper completion for the selected arm",
+        help="topic name used to receive gripper completion as Bool(True)",
     )
     parser.add_argument(
         "--arm_picking_finish_topic",

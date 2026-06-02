@@ -5,6 +5,8 @@ from typing import List, Sequence
 
 
 _PLANNER_ALIASES = {
+    "arm_init": "arm_init",
+    "arm-init": "arm_init",
     "arm_picking": "arm_picking",
     "arm-picking": "arm_picking",
     "arm_placing": "arm_placing",
@@ -28,11 +30,13 @@ def _planner_usage() -> str:
     return (
         "Usage:\n"
         "  ros2 run capstone_pkg main -- planner arm_picking [planner args...]\n"
+        "  ros2 run capstone_pkg main -- planner arm_init [planner args...]\n"
         "  ros2 run capstone_pkg main -- planner arm_placing [planner args...]\n"
         "  ros2 run capstone_pkg main -- planner arm_cart_picking [planner args...]\n"
         "  ros2 run capstone_pkg main -- planner tbrrt [planner args...]\n"
         "  ros2 run capstone_pkg main -- planner arm_cart [planner args...]\n"
         "  ros2 run capstone_pkg main -- planner arm_cart_profile [planner args...]\n"
+        "  ros2 run capstone_pkg main -- --planner arm_init [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_picking [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_placing [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_cart_picking [planner args...]\n"
@@ -40,6 +44,7 @@ def _planner_usage() -> str:
         "  ros2 run capstone_pkg main -- --planner arm_cart_profile [planner args...]\n"
         "\n"
         "Available planners:\n"
+        "  arm_init\n"
         "  arm_picking\n"
         "  arm_placing\n"
         "  arm_cart_picking\n"
@@ -92,6 +97,12 @@ def main_arm_picking(argv: Sequence[str] | None = None) -> int:
     from capstone_pkg.planner.ARM_PICKING.runner import main_arm_picking as _main_arm_picking
 
     return _main_arm_picking(_normalize_argv(argv))
+
+
+def main_arm_init(argv: Sequence[str] | None = None) -> int:
+    from capstone_pkg.planner.ARM_INIT.runner import main_arm_init as _main_arm_init
+
+    return _main_arm_init(_normalize_argv(argv))
 
 
 def main_arm_placing(argv: Sequence[str] | None = None) -> int:
@@ -148,6 +159,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(_planner_usage())
         return 0
 
+    if planner == "arm_init":
+        return main_arm_init(planner_args)
     if planner == "arm_picking":
         return main_arm_picking(planner_args)
     if planner == "arm_placing":
@@ -162,7 +175,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return main_arm_cart_profile(planner_args)
 
     print(
-        "[ERROR] planner must be one of: arm_picking, arm_placing, arm_cart_picking, tbrrt, arm_cart, arm_cart_profile",
+        "[ERROR] planner must be one of: arm_init, arm_picking, arm_placing, arm_cart_picking, tbrrt, arm_cart, arm_cart_profile",
         file=sys.stderr,
     )
     print(_planner_usage(), file=sys.stderr)

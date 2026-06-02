@@ -46,6 +46,7 @@ setup(
             'realsense = capstone_pkg.camera.view_realsense:main',
             'zed = capstone_pkg.camera.view_zed:main',
             'curobo_ik = capstone_pkg.kinematics.curobo_test_ik:main',
+            'arm_init = capstone_pkg.main:main_arm_init',
             'arm_picking = capstone_pkg.main:main_arm_picking',
             'arm_placing = capstone_pkg.main:main_arm_placing',
             'arm_cart_picking = capstone_pkg.main:main_arm_cart_picking',
