@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-from collections import deque
 import math
 import tempfile
 import threading
@@ -427,7 +426,8 @@ class ArmPlacingNode(Node):
         super().__init__("arm_placing")
         self._args = args
         self._request_cv = threading.Condition()
-        self._request_queue: deque[str] = deque()
+        self._pending_request_arm: str | None = None
+        self._request_active = False
         self._joint_state_cv = threading.Condition()
         self._joint_state_by_name: dict[str, float] = {}
         self._base_cart_cuboids = load_world_cuboids(str(args.collision_yaml))
@@ -567,28 +567,39 @@ class ArmPlacingNode(Node):
             return
 
         with self._request_cv:
-            self._request_queue.append(arm)
-            pending = len(self._request_queue)
+            if self._request_active or self._pending_request_arm is not None:
+                state = "active" if self._request_active else "pending"
+                self.get_logger().warning(
+                    f"Ignoring arm_placing_start arm={arm}: request already {state}"
+                )
+                return
+            self._pending_request_arm = arm
             self._request_cv.notify()
 
         self.get_logger().info(
-            f"Queued arm_placing_start arm={arm} pending={pending}"
+            f"Accepted arm_placing_start arm={arm}"
         )
 
     def _request_worker_loop(self) -> None:
         while rclpy.ok():
             with self._request_cv:
-                while not self._request_queue and rclpy.ok():
+                while self._pending_request_arm is None and rclpy.ok():
                     self._request_cv.wait(timeout=0.2)
                 if not rclpy.ok():
                     return
-                arm = self._request_queue.popleft()
-                remaining = len(self._request_queue)
+                arm = self._pending_request_arm
+                self._pending_request_arm = None
+                self._request_active = True
 
             self.get_logger().info(
-                f"Processing arm_placing_start arm={arm} remaining={remaining}"
+                f"Processing arm_placing_start arm={arm}"
             )
-            self._process_request(arm)
+            try:
+                self._process_request(arm)
+            finally:
+                with self._request_cv:
+                    self._request_active = False
+                    self._request_cv.notify_all()
 
     def _iter_startup_world_ymls(self) -> list[str | None]:
         candidates: list[str | None] = [

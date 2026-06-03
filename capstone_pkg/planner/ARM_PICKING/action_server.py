@@ -616,6 +616,10 @@ class ArmPickingCoordinator(Node):
         with self._state_lock:
             self._sequence_active = False
 
+    def _is_active(self) -> bool:
+        with self._state_lock:
+            return bool(self._sequence_active)
+
     def _iter_startup_world_ymls(self) -> list[str | None]:
         candidates: list[str | None] = [
             _resolve_world_yml(
@@ -695,6 +699,12 @@ class ArmPickingCoordinator(Node):
 
     def _on_object_grasp(self, msg: ObjectGrasp) -> None:
         label = str(getattr(msg, "label", "")).strip()
+        if not self._is_active():
+            self.get_logger().warning(
+                f"Ignoring ObjectGrasp label={label!r}: no active arm_picking sequence"
+            )
+            return
+
         try:
             arm = normalize_arm_name(msg.selected_arm)
         except ValueError:
@@ -715,6 +725,11 @@ class ArmPickingCoordinator(Node):
     def _on_gripper_finish(self, msg: Bool) -> None:
         if not bool(msg.data):
             self.get_logger().info("Ignoring gripper_finish=False")
+            return
+        if not self._is_active():
+            self.get_logger().warning(
+                "Ignoring gripper_finish=True: no active arm_picking sequence"
+            )
             return
 
         with self._gripper_finish_cv:
@@ -2081,6 +2096,8 @@ class ArmPickingCoordinator(Node):
                 return
             except Exception as exc:
                 grasp_attempt += 1
+                with self._grasp_cv:
+                    grasp_seq = max(grasp_seq, int(self._latest_grasp_seq))
                 self.get_logger().warning(
                     "[ARM_PICKING] grasp attempt failed; waiting for next ObjectGrasp: "
                     f"arm={normalize_arm_name(selected_arm)} "
