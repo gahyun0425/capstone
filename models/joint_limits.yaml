@@ -22,14 +22,14 @@ joint_limits:
     - -2.9361    # arm_l_joint4
     - -3.14      # arm_l_joint5
     - -1.57      # arm_l_joint6
-    - -1.8201    # arm_l_joint7
+    - -1.9199    # arm_l_joint7
     - -3.14      # arm_r_joint1
     - -3.14      # arm_r_joint2  (joint range in XML: -3.14 to 0)
     - -3.14      # arm_r_joint3
     - -2.9361    # arm_r_joint4
     - -3.14      # arm_r_joint5
     - -1.57      # arm_r_joint6
-    - -1.5804    # arm_r_joint7
+    - -1.2217    # arm_r_joint7
 
   upper:
     -  3.14      # arm_l_joint1
@@ -38,11 +38,11 @@ joint_limits:
     -  1.0786    # arm_l_joint4
     -  3.14      # arm_l_joint5
     -  1.57      # arm_l_joint6
-    -  1.5804    # arm_l_joint7
+    -  1.2217    # arm_l_joint7
     -  3.14      # arm_r_joint1
     -  0.0       # arm_r_joint2
     -  3.14      # arm_r_joint3
     -  1.0786    # arm_r_joint4
     -  3.14      # arm_r_joint5
     -  1.57      # arm_r_joint6
-    -  1.8201    # arm_r_joint7
+    -  1.9199    # arm_r_joint7

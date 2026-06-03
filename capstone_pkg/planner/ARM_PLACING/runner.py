@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import deque
 import math
 import tempfile
 import threading
@@ -21,7 +22,10 @@ from std_msgs.msg import Bool, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import yaml
 
-from capstone_pkg.kinematics.curobo_ik import get_single_arm_ik
+from capstone_pkg.kinematics.curobo_ik import (
+    get_single_arm_ik,
+    warmup_single_arm_ik_reachable,
+)
 from capstone_pkg.planner.arm_rrt_common.single_arm_motion import (
     build_active_joint_path,
     normalize_arm_name,
@@ -43,14 +47,13 @@ from capstone_pkg.utils.world_collision_bridge import (
 _ARM_TARGETS = {
     "left": {
         "position": (0.5, 0.1, 1.1),
-        "orientation_xyzw": (0.5, 0.5, 0.0, 0.0),
+        "orientation_xyzw": (1.0, 0.0, 0.0, 0.0),
     },
     "right": {
         "position": (0.5, -0.1, 1.1),
-        "orientation_xyzw": (0.5, -0.5, 0.0, 0.0),
+        "orientation_xyzw": (1.0, 0.0, 0.0, 0.0),
     },
 }
-
 _CSPACE_JOINT_NAMES = list(LEFT_JOINTS) + list(RIGHT_JOINTS)
 _SIM_GRIPPER_JOINT_NAMES = ["gripper_l_joint1", "gripper_r_joint1"]
 
@@ -398,6 +401,24 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--gripper_duration_s", type=float, default=1.0)
     ap.add_argument("--gripper_open_wait_s", type=float, default=1.2)
     ap.add_argument("--final_arm_target_z_m", type=float, default=1.3)
+    ap.add_argument(
+        "--startup_warmup",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="pre-initialize and warm up IK/collision objects before processing start topics",
+    )
+    ap.add_argument(
+        "--startup_warmup_iters",
+        type=int,
+        default=1,
+        help="number of reachable IK warmup iterations to run per arm/world at startup",
+    )
+    ap.add_argument(
+        "--startup_warmup_batch_size",
+        type=int,
+        default=None,
+        help="batch size used for startup IK warmup solves; defaults to --ik_batch",
+    )
     return ap
 
 
@@ -405,8 +426,8 @@ class ArmPlacingNode(Node):
     def __init__(self, args: argparse.Namespace):
         super().__init__("arm_placing")
         self._args = args
-        self._busy = False
-        self._lock = threading.Lock()
+        self._request_cv = threading.Condition()
+        self._request_queue: deque[str] = deque()
         self._joint_state_cv = threading.Condition()
         self._joint_state_by_name: dict[str, float] = {}
         self._base_cart_cuboids = load_world_cuboids(str(args.collision_yaml))
@@ -419,6 +440,7 @@ class ArmPlacingNode(Node):
             self._base_cart_cuboids,
             prefix="capstone_cart_collision_spawn_",
         )
+        self._run_startup_warmup()
 
         self._qos_cmd = QoSProfile(
             reliability=ReliabilityPolicy.RELIABLE,
@@ -529,6 +551,11 @@ class ArmPlacingNode(Node):
             f"{args.arm_placing_start_topic} and publishing finish on "
             f"{args.arm_placing_finish_topic}"
         )
+        self._request_worker = threading.Thread(
+            target=self._request_worker_loop,
+            daemon=True,
+        )
+        self._request_worker.start()
 
     def _start_callback(self, msg: String) -> None:
         try:
@@ -539,21 +566,105 @@ class ArmPlacingNode(Node):
             )
             return
 
-        with self._lock:
-            if self._busy:
-                self.get_logger().warn(
-                    f"Ignoring arm_placing_start for arm={arm}: previous request still running"
-                )
-                return
-            self._busy = True
+        with self._request_cv:
+            self._request_queue.append(arm)
+            pending = len(self._request_queue)
+            self._request_cv.notify()
 
-        self.get_logger().info(f"Received arm_placing_start arm={arm}")
-        worker = threading.Thread(
-            target=self._process_request,
-            args=(arm,),
-            daemon=True,
+        self.get_logger().info(
+            f"Queued arm_placing_start arm={arm} pending={pending}"
         )
-        worker.start()
+
+    def _request_worker_loop(self) -> None:
+        while rclpy.ok():
+            with self._request_cv:
+                while not self._request_queue and rclpy.ok():
+                    self._request_cv.wait(timeout=0.2)
+                if not rclpy.ok():
+                    return
+                arm = self._request_queue.popleft()
+                remaining = len(self._request_queue)
+
+            self.get_logger().info(
+                f"Processing arm_placing_start arm={arm} remaining={remaining}"
+            )
+            self._process_request(arm)
+
+    def _iter_startup_world_ymls(self) -> list[str | None]:
+        candidates: list[str | None] = [
+            self._resolved_world_yml,
+            str(self._active_cart_world_yml),
+        ]
+        out: list[str | None] = []
+        seen: set[str] = set()
+        for item in candidates:
+            normalized = None if item in (None, "", "none", "None") else str(item)
+            key = "<none>" if normalized is None else normalized
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(normalized)
+        return out
+
+    def _run_startup_warmup(self) -> None:
+        if not bool(getattr(self._args, "startup_warmup", True)):
+            self.get_logger().info("Startup warmup disabled")
+            return
+
+        warmup_iters = max(0, int(getattr(self._args, "startup_warmup_iters", 1)))
+        configured_batch_size = getattr(self._args, "startup_warmup_batch_size", None)
+        if configured_batch_size is None:
+            configured_batch_size = getattr(self._args, "ik_batch", 100)
+        warmup_batch_size = max(1, int(configured_batch_size))
+        if warmup_iters <= 0:
+            self.get_logger().info(
+                "Startup warmup skipped because startup_warmup_iters <= 0"
+            )
+            return
+
+        from capstone_pkg.collision_check.collision import get_self_collision_checker
+
+        worlds = self._iter_startup_world_ymls()
+        t0 = time.monotonic()
+        self.get_logger().info(
+            "Starting ARM_PLACING warmup "
+            f"(iters={warmup_iters}, batch_size={warmup_batch_size}, worlds={len(worlds)})"
+        )
+        for world_index, world_yml in enumerate(worlds):
+            world_label = str(world_yml) if world_yml is not None else "none"
+            self.get_logger().info(f"[warmup] world={world_label}")
+            checker = get_self_collision_checker(
+                str(self._args.robot_yml),
+                cpu=bool(self._args.cpu),
+                world_yml=world_yml,
+            )
+            try:
+                _ = checker.check_single([0.0 for _ in checker.cspace_names])
+            except Exception:
+                pass
+
+            for arm_index, arm in enumerate(("left", "right")):
+                ik = get_single_arm_ik(
+                    str(self._args.robot_yml),
+                    arm=arm,
+                    cpu=bool(self._args.cpu),
+                    world_yml=world_yml,
+                )
+                warmup_single_arm_ik_reachable(
+                    ik,
+                    iters=warmup_iters,
+                    batch_size=warmup_batch_size,
+                    noise_std=float(getattr(self._args, "ik_seed_noise_std", 0.25)),
+                    random_seed=int(getattr(self._args, "ik_seed", 0))
+                    + (world_index * 17)
+                    + arm_index,
+                )
+                self.get_logger().info(
+                    f"[warmup] ready arm={arm} world={world_label}"
+                )
+        self.get_logger().info(
+            f"ARM_PLACING warmup completed in {time.monotonic() - t0:.2f}s"
+        )
 
     def _joint_state_callback(self, msg: JointState) -> None:
         updates = {}
@@ -677,9 +788,6 @@ class ArmPlacingNode(Node):
             self._publish_finish()
         except Exception as exc:
             self.get_logger().error(f"arm placing failed for arm={arm}: {exc}")
-        finally:
-            with self._lock:
-                self._busy = False
 
     def _build_arm_target_pose(self, arm: str) -> Pose:
         target = _ARM_TARGETS[arm]
@@ -1289,13 +1397,15 @@ def main_arm_placing(argv: Sequence[str] | None = None) -> int:
     args, _unknown = build_parser().parse_known_args(argv_list)
 
     rclpy.init(args=argv_list)
-    node = ArmPlacingNode(args)
+    node: ArmPlacingNode | None = None
     try:
+        node = ArmPlacingNode(args)
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         rclpy.shutdown()
     return 0
 

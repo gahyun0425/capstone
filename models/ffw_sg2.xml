@@ -141,10 +141,10 @@
       <joint frictionloss="0.1" armature="0.1" damping="3.0" />
       <position kp="200" dampratio="1" forcerange="-5.1 5.1" />
       <default class="arm_l_joint7">
-        <joint axis="1 0 0" range="-1.8201 1.5804" />
+        <joint axis="1 0 0" range="-1.9199 1.2217" />
         </default>
       <default class="arm_r_joint7">
-        <joint axis="1 0 0" range="-1.5804 1.8201" />
+        <joint axis="1 0 0" range="-1.2217 1.9199" />
         </default>
       </default>
     <default class="gripper">
