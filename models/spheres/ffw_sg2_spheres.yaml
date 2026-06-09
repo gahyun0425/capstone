@@ -1,4 +1,16 @@
 collision_spheres:
+  base_link:
+  - center: [0.0, 0.0, 0.18]
+    radius: 0.28
+  - center: [-0.20, 0.0, 0.18]
+    radius: 0.22
+  - center: [0.16, 0.0, 0.18]
+    radius: 0.22
+  - center: [-0.05, 0.22, 0.18]
+    radius: 0.16
+  - center: [-0.05, -0.22, 0.18]
+    radius: 0.16
+    
   lift_link:
   - center:
     - -0.136

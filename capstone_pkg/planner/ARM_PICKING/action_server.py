@@ -13,7 +13,7 @@ from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 from grasp_msgs.msg import ObjectAlign, ObjectGrasp
 from capstone_pkg.planner.arm_rrt_common.path_publisher import (
@@ -592,7 +592,7 @@ class ArmPickingCoordinator(Node):
             self._on_gripper_finish,
             self.qos_cmd,
         )
-        self._gripper_start_pub = self.create_publisher(Bool, str(args.gripper_start_topic), 10)
+        self._gripper_start_pub = self.create_publisher(String, str(args.gripper_start_topic), 10)
         self._arm_picking_finish_pub = self.create_publisher(
             Bool,
             str(args.arm_picking_finish_topic),
@@ -1934,10 +1934,10 @@ class ArmPickingCoordinator(Node):
 
     def _publish_gripper_start(self, arm: str) -> None:
         normalized_arm = normalize_arm_name(arm)
-        msg = Bool()
-        msg.data = True
+        msg = String()
+        msg.data = normalized_arm
         self._gripper_start_pub.publish(msg)
-        self.get_logger().info(f"Published gripper_start=True for arm={normalized_arm}")
+        self.get_logger().info(f"Published gripper_start={normalized_arm!r}")
 
     def _publish_arm_picking_finish(self, arm: str, *, stage: str) -> None:
         msg = Bool()
@@ -2016,7 +2016,7 @@ class ArmPickingCoordinator(Node):
                 self._wait_for_single_arm(stage="grasp", plan=grasp_plan)
 
                 gripper_finish_seq = self._latest_gripper_finish_seq
-                self._publish_gripper_start(selected_arm)
+                self._publish_gripper_start(grasp_msg.selected_arm)
                 self._wait_for_gripper_finish(
                     arm=selected_arm,
                     min_seq=gripper_finish_seq,
@@ -2201,7 +2201,7 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
     parser.add_argument(
         "--gripper_start_topic",
         default="/gripper_start",
-        help="topic name used to publish gripper start as Bool(True)",
+        help="topic name used to publish gripper start as String('left' or 'right')",
     )
     parser.add_argument(
         "--gripper_finish_topic",

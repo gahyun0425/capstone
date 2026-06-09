@@ -43,6 +43,7 @@ setup(
         'console_scripts': [
             'main = capstone_pkg.main:main',
             'simulation = capstone_pkg.simulation:main',
+            'door_simulation = capstone_pkg.door_simulation:main',
             'realsense = capstone_pkg.camera.view_realsense:main',
             'zed = capstone_pkg.camera.view_zed:main',
             'curobo_ik = capstone_pkg.kinematics.curobo_test_ik:main',
@@ -52,6 +53,7 @@ setup(
             'arm_cart_picking = capstone_pkg.main:main_arm_cart_picking',
             'arm_cart = capstone_pkg.main:main_arm_cart',
             'arm_cart_profile = capstone_pkg.main:main_arm_cart_profile',
+            'arm_door = capstone_pkg.main:main_arm_door',
             'tbrrt_ik_benchmark = capstone_pkg.planner.test.tbrrt_ik_benchmark:main',
             'impedance = capstone_pkg.impedance.impedance:main',
             'visualize_gripper_spheres = capstone_pkg.collision_check.visualize_gripper_spheres:main',

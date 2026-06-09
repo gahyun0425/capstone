@@ -23,6 +23,9 @@ _PLANNER_ALIASES = {
     "arm-cart-profile": "arm_cart_profile",
     "cart_profile": "arm_cart_profile",
     "cart-profile": "arm_cart_profile",
+    "arm_door": "arm_door",
+    "arm-door": "arm_door",
+    "door": "arm_door",
 }
 
 
@@ -36,12 +39,14 @@ def _planner_usage() -> str:
         "  ros2 run capstone_pkg main -- planner tbrrt [planner args...]\n"
         "  ros2 run capstone_pkg main -- planner arm_cart [planner args...]\n"
         "  ros2 run capstone_pkg main -- planner arm_cart_profile [planner args...]\n"
+        "  ros2 run capstone_pkg main -- planner arm_door [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_init [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_picking [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_placing [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_cart_picking [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_cart [planner args...]\n"
         "  ros2 run capstone_pkg main -- --planner arm_cart_profile [planner args...]\n"
+        "  ros2 run capstone_pkg main -- --planner arm_door [planner args...]\n"
         "\n"
         "Available planners:\n"
         "  arm_init\n"
@@ -51,10 +56,12 @@ def _planner_usage() -> str:
         "  tbrrt\n"
         "  arm_cart\n"
         "  arm_cart_profile\n"
+        "  arm_door\n"
         "\n"
         "Aliases:\n"
         "  cart -> arm_cart\n"
         "  cart_profile -> arm_cart_profile\n"
+        "  door -> arm_door\n"
     )
 
 
@@ -139,6 +146,12 @@ def main_arm_cart_profile(argv: Sequence[str] | None = None) -> int:
     return _main_arm_cart_profile(_normalize_argv(argv))
 
 
+def main_arm_door(argv: Sequence[str] | None = None) -> int:
+    from capstone_pkg.planner.ARM_DOOR.runner import main_arm_door as _main_arm_door
+
+    return _main_arm_door(_normalize_argv(argv))
+
+
 def main_cart(argv: Sequence[str] | None = None) -> int:
     return main_arm_cart(argv)
 
@@ -173,9 +186,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         return main_arm_cart(planner_args)
     if planner == "arm_cart_profile":
         return main_arm_cart_profile(planner_args)
+    if planner == "arm_door":
+        return main_arm_door(planner_args)
 
     print(
-        "[ERROR] planner must be one of: arm_init, arm_picking, arm_placing, arm_cart_picking, tbrrt, arm_cart, arm_cart_profile",
+        "[ERROR] planner must be one of: arm_init, arm_picking, arm_placing, arm_cart_picking, tbrrt, arm_cart, arm_cart_profile, arm_door",
         file=sys.stderr,
     )
     print(_planner_usage(), file=sys.stderr)

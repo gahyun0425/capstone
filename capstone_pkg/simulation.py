@@ -41,7 +41,6 @@ GRIPPER_CLOSED_JOINTS = [
     "gripper_l_joint1", "gripper_l_joint2", "gripper_l_joint3", "gripper_l_joint4",
     "gripper_r_joint1", "gripper_r_joint2", "gripper_r_joint3", "gripper_r_joint4",
 ]
-GRIPPER_CLOSED_VALUE = 0.5
 
 
 def _safe_symlink(src: str, dst: str) -> None:
@@ -166,6 +165,7 @@ def _inject_world_box_slots(mjcf_path: str, max_boxes: int, box_group: int) -> s
     tmp = tempfile.NamedTemporaryFile(
         prefix="capstone_mujoco_world_boxes_",
         suffix=".xml",
+        dir=models_root,
         delete=False,
     )
     tmp_path = tmp.name

@@ -1,0 +1,202 @@
+<mujoco model="door_ffw_sg2">
+  <include file="ffw_sg2.xml"/>
+
+  <!-- Showcase refrigerator dimensions: W650 x D580 x H1850 mm. -->
+  <statistic center="0.75 0 0.9" extent="2.2"/>
+
+  <visual>
+    <headlight diffuse="0.7 0.7 0.7" ambient="0.35 0.35 0.35" specular="0.05 0.05 0.05"/>
+    <rgba haze="0.15 0.18 0.22 1"/>
+    <global azimuth="135" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <material name="fridge_outer_mat" rgba="0.86 0.88 0.88 1"/>
+    <material name="fridge_inner_mat" rgba="0.18 0.20 0.22 1"/>
+    <material name="fridge_glass_mat" rgba="0.45 0.72 0.95 0.32"/>
+    <material name="fridge_gasket_mat" rgba="0.04 0.05 0.055 1"/>
+    <material name="fridge_handle_mat" rgba="0.78 0.80 0.82 1"/>
+    <material name="fridge_shelf_mat" rgba="0.72 0.82 0.90 0.45"/>
+  </asset>
+
+  <worldbody>
+    <!--
+      Refrigerator frame convention:
+      - X is depth, with the front face toward the robot at smaller X.
+      - Y is width.
+      - Z is height.
+      - Outer size is exactly 0.650 m x 0.580 m x 1.850 m.
+    -->
+    <body name="showcase_fridge" pos="0.962 -0.261 0.925">
+      <!-- Static cabinet: depth 0.580, width 0.650, height 1.850. -->
+      <geom name="fridge_back_panel"
+            type="box"
+            size="0.012 0.325 0.925"
+            pos="0.278 0 0"
+            material="fridge_outer_mat"
+            contype="1"
+            conaffinity="1"/>
+      <geom name="fridge_left_panel"
+            type="box"
+            size="0.290 0.012 0.925"
+            pos="0 0.313 0"
+            material="fridge_outer_mat"
+            contype="1"
+            conaffinity="1"/>
+      <geom name="fridge_right_panel"
+            type="box"
+            size="0.290 0.012 0.925"
+            pos="0 -0.313 0"
+            material="fridge_outer_mat"
+            contype="1"
+            conaffinity="1"/>
+      <geom name="fridge_top_panel"
+            type="box"
+            size="0.290 0.325 0.012"
+            pos="0 0 0.913"
+            material="fridge_outer_mat"
+            contype="1"
+            conaffinity="1"/>
+      <geom name="fridge_bottom_panel"
+            type="box"
+            size="0.290 0.325 0.012"
+            pos="0 0 -0.913"
+            material="fridge_outer_mat"
+            contype="1"
+            conaffinity="1"/>
+
+      <!-- Dark interior and shelves for visual scale. -->
+      <geom name="fridge_inner_back"
+            type="box"
+            size="0.006 0.285 0.800"
+            pos="0.240 0 0.020"
+            material="fridge_inner_mat"
+            contype="0"
+            conaffinity="0"/>
+      <geom name="fridge_shelf_1"
+            type="box"
+            size="0.245 0.280 0.006"
+            pos="-0.020 0 -0.455"
+            material="fridge_shelf_mat"
+            contype="1"
+            conaffinity="1"/>
+      <geom name="fridge_shelf_2"
+            type="box"
+            size="0.245 0.280 0.006"
+            pos="-0.020 0 -0.150"
+            material="fridge_shelf_mat"
+            contype="1"
+            conaffinity="1"/>
+      <geom name="fridge_shelf_3"
+            type="box"
+            size="0.245 0.280 0.006"
+            pos="-0.020 0 0.155"
+            material="fridge_shelf_mat"
+            contype="1"
+            conaffinity="1"/>
+      <geom name="fridge_shelf_4"
+            type="box"
+            size="0.245 0.280 0.006"
+            pos="-0.020 0 0.460"
+            material="fridge_shelf_mat"
+            contype="1"
+            conaffinity="1"/>
+
+      <!-- Hinged glass door. Hinge is on the right side; handle is on the left side. -->
+      <body name="fridge_glass_door" pos="-0.302 -0.325 0">
+        <joint name="fridge_door_hinge_joint"
+               type="hinge"
+               axis="0 0 1"
+               range="0 1.745329"
+               limited="true"
+               damping="4.0"
+               frictionloss="0.2"/>
+        <site name="fridge_hinge_axis_site"
+              pos="0 0 0"
+              size="0.012"
+              rgba="1 0.6 0.1 1"/>
+
+        <geom name="fridge_door_glass"
+              type="box"
+              size="0.012 0.289 0.780"
+              pos="0 0.325 0.000"
+              material="fridge_glass_mat"
+              mass="4.0"
+              contype="1"
+              conaffinity="1"/>
+        <geom name="fridge_door_right_frame"
+              type="box"
+              size="0.018 0.018 0.842"
+              pos="0 0.020 0"
+              material="fridge_gasket_mat"
+              mass="1.0"
+              contype="1"
+              conaffinity="1"/>
+        <geom name="fridge_door_left_frame"
+              type="box"
+              size="0.018 0.018 0.842"
+              pos="0 0.630 0"
+              material="fridge_gasket_mat"
+              mass="1.0"
+              contype="1"
+              conaffinity="1"/>
+        <geom name="fridge_door_top_frame"
+              type="box"
+              size="0.018 0.325 0.018"
+              pos="0 0.325 0.842"
+              material="fridge_gasket_mat"
+              mass="1.0"
+              contype="1"
+              conaffinity="1"/>
+        <geom name="fridge_door_bottom_frame"
+              type="box"
+              size="0.018 0.325 0.018"
+              pos="0 0.325 -0.842"
+              material="fridge_gasket_mat"
+              mass="1.0"
+              contype="1"
+              conaffinity="1"/>
+
+        <!-- Left-side vertical pull handle for right-arm grasp experiments. -->
+        <geom name="fridge_handle_bar"
+              type="cylinder"
+              size="0.018 0.100"
+              pos="-0.060 0.586 0.075"
+              material="fridge_handle_mat"
+              mass="0.6"
+              contype="1"
+              conaffinity="1"/>
+        <geom name="fridge_handle_top_mount"
+              type="box"
+              size="0.040 0.018 0.018"
+              pos="-0.034 0.586 0.175"
+              material="fridge_handle_mat"
+              mass="0.15"
+              contype="1"
+              conaffinity="1"/>
+        <geom name="fridge_handle_bottom_mount"
+              type="box"
+              size="0.040 0.018 0.018"
+              pos="-0.034 0.586 -0.025"
+              material="fridge_handle_mat"
+              mass="0.15"
+              contype="1"
+              conaffinity="1"/>
+        <site name="fridge_handle_center_site"
+              pos="-0.060 0.586 0.075"
+              size="0.018"
+              rgba="0.1 0.9 0.2 1"/>
+      </body>
+    </body>
+  </worldbody>
+
+  <actuator>
+    <position name="fridge_door_hinge"
+              joint="fridge_door_hinge_joint"
+              kp="80"
+              dampratio="1"
+              forcerange="-40 40"
+              ctrlrange="0 1.745329"
+              ctrllimited="true"/>
+  </actuator>
+</mujoco>

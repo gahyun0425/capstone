@@ -178,7 +178,7 @@
           friction="1 0.005 0.0001"/>
 
 
-    <body name="base_link" pos="0 0 0.15">
+    <body name="base_link" pos="0 0 0">
       <inertial pos="-0.0457 0.0066 0.1943" mass="35.99" diaginertia="0.65 0.65 0.96" />
       <freejoint name="floating_base" />
       <geom type="mesh" mesh="base_mobile_assy" material="black" class="visual" />
