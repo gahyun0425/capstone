@@ -209,6 +209,37 @@ def _build_arm_door_parser():
     )
     ap.add_argument("--door_open_base_publish_step_m", type=float, default=0.02)
     ap.add_argument("--door_open_base_publish_step_deg", type=float, default=3.0)
+    ap.add_argument(
+        "--door_open_base_publish_smooth_window",
+        type=int,
+        default=0,
+        help="optional centered moving-average window over real opening base poses before cmd_vel conversion; 0 disables",
+    )
+    ap.add_argument(
+        "--door_open_topp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="spline and TOPP-retime the coordinated arm+base real opening path",
+    )
+    ap.add_argument(
+        "--door_open_topp_spline_mode",
+        choices=("cubic", "linear"),
+        default="cubic",
+        help="path interpolation used before TOPP; linear avoids cubic overshoot on short arm paths",
+    )
+    ap.add_argument("--door_open_topp_spline_step", type=float, default=0.02)
+    ap.add_argument("--door_open_topp_arm_max_velocity", type=float, default=0.35)
+    ap.add_argument("--door_open_topp_arm_max_acceleration", type=float, default=0.60)
+    ap.add_argument("--door_open_topp_base_max_linear_accel", type=float, default=0.15)
+    ap.add_argument("--door_open_topp_base_max_angular_accel", type=float, default=0.30)
+    ap.add_argument("--door_open_topp_safety_scale", type=float, default=1.10)
+    ap.add_argument("--door_open_topp_max_iterations", type=int, default=30)
+    ap.add_argument(
+        "--door_open_topp_max_duration_s",
+        type=float,
+        default=0.0,
+        help="optional cap for retimed opening duration; <=0 leaves TOPP duration unconstrained",
+    )
     ap.add_argument("--door_open_base_pose_topic", default="/base_pose_cmd")
     ap.add_argument(
         "--real_base_cmd_vel_topic",
@@ -217,6 +248,12 @@ def _build_arm_door_parser():
     )
     ap.add_argument("--real_base_max_linear_mps", type=float, default=0.35)
     ap.add_argument("--real_base_max_angular_rps", type=float, default=0.60)
+    ap.add_argument(
+        "--real_base_cmd_rate_hz",
+        type=float,
+        default=30.0,
+        help="rate used to stream repeated /cmd_vel samples for real base opening motion",
+    )
     ap.add_argument("--real_base_stop_duration_s", type=float, default=0.5)
     ap.add_argument("--door_unlock_topic", default=DEFAULT_DOOR_UNLOCK_TOPIC)
     ap.add_argument(
@@ -685,6 +722,186 @@ def _densify_opening_publish_samples(
     return dense_path, dense_base
 
 
+def _smooth_opening_base_poses(
+    base_poses: Sequence[Sequence[float]],
+    *,
+    window: int,
+) -> list[list[float]]:
+    poses = [[float(v) for v in pose] for pose in base_poses]
+    if len(poses) <= 2:
+        return poses
+    window = int(window)
+    if window <= 1:
+        return poses
+    if window % 2 == 0:
+        window += 1
+
+    yaw_unwrapped = [poses[0][2]]
+    for pose in poses[1:]:
+        yaw_unwrapped.append(yaw_unwrapped[-1] + _wrap_pi(float(pose[2]) - yaw_unwrapped[-1]))
+
+    half = window // 2
+    smooth: list[list[float]] = []
+    for idx in range(len(poses)):
+        lo = max(0, idx - half)
+        hi = min(len(poses), idx + half + 1)
+        count = float(hi - lo)
+        smooth.append(
+            [
+                sum(poses[j][0] for j in range(lo, hi)) / count,
+                sum(poses[j][1] for j in range(lo, hi)) / count,
+                _wrap_pi(sum(yaw_unwrapped[j] for j in range(lo, hi)) / count),
+            ]
+        )
+
+    smooth[0] = list(poses[0])
+    smooth[-1] = list(poses[-1])
+    return smooth
+
+
+def _unwrap_base_yaws(base_poses: Sequence[Sequence[float]]) -> list[list[float]]:
+    poses = [[float(v) for v in pose] for pose in base_poses]
+    if not poses:
+        return []
+    out = [[poses[0][0], poses[0][1], poses[0][2]]]
+    for pose in poses[1:]:
+        prev_yaw = out[-1][2]
+        out.append([pose[0], pose[1], prev_yaw + _wrap_pi(pose[2] - prev_yaw)])
+    return out
+
+
+def _dedupe_numeric_path(path: Sequence[Sequence[float]], *, eps: float = 1.0e-9) -> list[list[float]]:
+    rows = [[float(v) for v in row] for row in path]
+    if not rows:
+        return []
+    out = [rows[0]]
+    for row in rows[1:]:
+        if len(row) != len(out[-1]):
+            raise RuntimeError("numeric path dimension changed")
+        dist = math.sqrt(sum((row[i] - out[-1][i]) ** 2 for i in range(len(row))))
+        if dist > float(eps):
+            out.append(row)
+    if len(out) == 1 and len(rows) > 1:
+        out.append(rows[-1])
+    return out
+
+
+def _linear_interpolate_numeric_path(
+    path: Sequence[Sequence[float]],
+    *,
+    step: float,
+) -> list[list[float]]:
+    rows = _dedupe_numeric_path(path)
+    if len(rows) <= 1:
+        return rows
+    step = max(1.0e-4, float(step))
+    out = [list(rows[0])]
+    for q0, q1 in zip(rows[:-1], rows[1:]):
+        if len(q0) != len(q1):
+            raise RuntimeError("linear interpolation path dimension changed")
+        dist = math.sqrt(sum((q1[i] - q0[i]) ** 2 for i in range(len(q0))))
+        n = max(1, int(math.ceil(dist / step)))
+        for sub_idx in range(1, n + 1):
+            t = float(sub_idx) / float(n)
+            out.append([q0[i] + (q1[i] - q0[i]) * t for i in range(len(q0))])
+    return out
+
+
+def _retime_opening_arm_base_path(
+    args,
+    arm_path: Sequence[Sequence[float]],
+    base_poses: Sequence[Sequence[float]],
+) -> tuple[list[list[float]], list[list[float]], list[list[float]], list[list[float]], list[float]]:
+    from capstone_pkg.planner.tbrrt.postprocess import topp_retime_path
+    import torch
+
+    arm_rows = [[float(v) for v in q] for q in arm_path]
+    base_rows = _unwrap_base_yaws(base_poses)
+    if len(arm_rows) != len(base_rows):
+        raise RuntimeError("opening TOPP path length does not match base pose length")
+    if len(arm_rows) < 2:
+        raise RuntimeError("opening TOPP path must contain at least two waypoints")
+
+    arm_dim = len(arm_rows[0])
+    if arm_dim <= 0:
+        raise RuntimeError("opening TOPP arm path has no joints")
+    combined: list[list[float]] = []
+    for idx, (q, base_pose) in enumerate(zip(arm_rows, base_rows)):
+        if len(q) != arm_dim:
+            raise RuntimeError(f"opening TOPP arm path dimension changed at idx={idx}")
+        combined.append(list(q) + list(base_pose))
+
+    spline_mode = str(getattr(args, "door_open_topp_spline_mode", "cubic")).strip().lower()
+    if spline_mode == "cubic":
+        from capstone_pkg.planner.arm_rrt_common.spline import spline_interpolate_path
+
+        spline_step = max(1.0e-4, float(args.door_open_topp_spline_step))
+        spline_path = spline_interpolate_path(combined, dt=spline_step)
+    elif spline_mode == "linear":
+        spline_path = _linear_interpolate_numeric_path(
+            combined,
+            step=max(1.0e-4, float(args.door_open_topp_spline_step)),
+        )
+    else:
+        raise RuntimeError(f"unknown door_open_topp_spline_mode={spline_mode!r}")
+    if len(spline_path) < 2:
+        raise RuntimeError("opening TOPP spline output has fewer than two points")
+
+    max_duration = float(getattr(args, "door_open_topp_max_duration_s", 0.0))
+    duration_cap = max_duration if max_duration > 0.0 else None
+    max_linear = max(1.0e-4, float(args.real_base_max_linear_mps))
+    max_angular = max(1.0e-4, float(args.real_base_max_angular_rps))
+    vmax = (
+        [max(1.0e-4, float(args.door_open_topp_arm_max_velocity))] * arm_dim
+        + [max_linear, max_linear, max_angular]
+    )
+    amax = (
+        [max(1.0e-4, float(args.door_open_topp_arm_max_acceleration))] * arm_dim
+        + [
+            max(1.0e-4, float(args.door_open_topp_base_max_linear_accel)),
+            max(1.0e-4, float(args.door_open_topp_base_max_linear_accel)),
+            max(1.0e-4, float(args.door_open_topp_base_max_angular_accel)),
+        ]
+    )
+    trajectory = topp_retime_path(
+        torch.tensor(spline_path, dtype=torch.float32),
+        max_velocity=vmax,
+        max_acceleration=amax,
+        output_dt=max(1.0e-3, float(args.door_open_dt)),
+        max_duration_sec=duration_cap,
+        safety_scale=max(1.0, float(args.door_open_topp_safety_scale)),
+        max_iterations=max(1, int(args.door_open_topp_max_iterations)),
+    )
+
+    q_all = trajectory.q.detach().cpu().tolist()
+    qdot_all = trajectory.qdot.detach().cpu().tolist()
+    qddot_all = trajectory.qddot.detach().cpu().tolist()
+    times = [float(v) for v in trajectory.t.detach().cpu().tolist()]
+
+    retimed_arm = [[float(v) for v in row[:arm_dim]] for row in q_all]
+    retimed_base = [
+        [float(row[arm_dim]), float(row[arm_dim + 1]), _wrap_pi(float(row[arm_dim + 2]))]
+        for row in q_all
+    ]
+    arm_velocities = [[float(v) for v in row[:arm_dim]] for row in qdot_all]
+    arm_accelerations = [[float(v) for v in row[:arm_dim]] for row in qddot_all]
+    if arm_velocities:
+        arm_velocities[0] = [0.0] * arm_dim
+        arm_velocities[-1] = [0.0] * arm_dim
+    if arm_accelerations:
+        arm_accelerations[0] = [0.0] * arm_dim
+        arm_accelerations[-1] = [0.0] * arm_dim
+
+    print(
+        "[ARM_DOOR][OPEN][REAL][TOPP] "
+        f"raw={len(arm_rows)} mode={spline_mode} interp={len(spline_path)} output={len(retimed_arm)} "
+        f"duration={trajectory.duration_sec:.3f}s dt={float(args.door_open_dt):.3f}s "
+        f"max_v={trajectory.max_abs_velocity:.3f} max_a={trajectory.max_abs_acceleration:.3f} "
+        f"time_scale={trajectory.time_scale:.3f}"
+    )
+    return retimed_arm, retimed_base, arm_velocities, arm_accelerations, times
+
+
 def _clamp_abs(value: float, limit: float) -> float:
     limit = abs(float(limit))
     if limit <= 0.0:
@@ -720,6 +937,46 @@ def _base_pose_delta_to_body_twist(
         or abs(wz_clamped - wz) > 1.0e-9
     )
     return vx_clamped, vy_clamped, wz_clamped, clamped
+
+
+def _build_timed_joint_trajectory(
+    *,
+    joint_names: Sequence[str],
+    positions: Sequence[Sequence[float]],
+    velocities: Sequence[Sequence[float]],
+    accelerations: Sequence[Sequence[float]],
+    times: Sequence[float],
+):
+    from capstone_pkg.planner.arm_rrt_common.path_publisher import _duration_from_seconds
+    from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
+
+    if not positions:
+        raise RuntimeError("timed JointTrajectory path is empty")
+    if len(positions) != len(times):
+        raise RuntimeError("timed JointTrajectory positions/time length mismatch")
+    if velocities and len(velocities) != len(positions):
+        raise RuntimeError("timed JointTrajectory velocity length mismatch")
+    if accelerations and len(accelerations) != len(positions):
+        raise RuntimeError("timed JointTrajectory acceleration length mismatch")
+
+    names = [str(name) for name in joint_names]
+    msg = JointTrajectory()
+    msg.joint_names = names
+    last_t = 0.0
+    for idx, q in enumerate(positions):
+        if len(q) != len(names):
+            raise RuntimeError(f"timed JointTrajectory point {idx} dimension mismatch")
+        point_t = max(last_t, float(times[idx]))
+        last_t = point_t
+        p = JointTrajectoryPoint()
+        p.positions = [float(v) for v in q]
+        if velocities:
+            p.velocities = [float(v) for v in velocities[idx]]
+        if accelerations:
+            p.accelerations = [float(v) for v in accelerations[idx]]
+        p.time_from_start = _duration_from_seconds(point_t)
+        msg.points.append(p)
+    return msg
 
 
 def _resolve_opening_world_yml(raw_value: str, resolved_world_yml: str | None) -> str | None:
@@ -1958,12 +2215,43 @@ def _publish_real_opening_path_with_base(
     publish_joint_names = [str(name) for name in joint_names]
     publish_path = [[float(v) for v in q] for q in path]
     publish_base_poses = [[float(v) for v in pose] for pose in base_poses]
+    publish_arm_velocities: list[list[float]] = []
+    publish_arm_accelerations: list[list[float]] = []
+    publish_times: list[float] = []
     if len(publish_path) != len(publish_base_poses):
         raise RuntimeError("real opening base pose path length does not match arm path length")
     if len(publish_path) < 2:
         raise RuntimeError("real opening path must contain at least two waypoints for base cmd_vel")
 
-    if bool(args.door_open_base_publish_interp):
+    smooth_window = int(getattr(args, "door_open_base_publish_smooth_window", 0))
+    if smooth_window > 1:
+        old_base_poses = publish_base_poses
+        publish_base_poses = _smooth_opening_base_poses(
+            publish_base_poses,
+            window=smooth_window,
+        )
+        changed_count = sum(
+            1
+            for old_pose, new_pose in zip(old_base_poses, publish_base_poses)
+            if (
+                math.hypot(new_pose[0] - old_pose[0], new_pose[1] - old_pose[1]) > 1.0e-6
+                or abs(_wrap_pi(new_pose[2] - old_pose[2])) > 1.0e-6
+            )
+        )
+        print(
+            "[ARM_DOOR][OPEN][REAL][BASE] "
+            f"smoothed base publish poses window={smooth_window} changed={changed_count}/{len(publish_base_poses)}"
+        )
+
+    if bool(getattr(args, "door_open_topp", True)):
+        (
+            publish_path,
+            publish_base_poses,
+            publish_arm_velocities,
+            publish_arm_accelerations,
+            publish_times,
+        ) = _retime_opening_arm_base_path(args, publish_path, publish_base_poses)
+    elif bool(args.door_open_base_publish_interp):
         old_count = len(publish_path)
         publish_path, publish_base_poses = _densify_opening_publish_samples(
             publish_path,
@@ -2029,16 +2317,26 @@ def _publish_real_opening_path_with_base(
             raise RuntimeError(msg)
         node.get_logger().warning(msg + "; publishing anyway.")
 
-    traj_msg = _build_joint_trajectory(
-        publish_path,
-        publish_joint_names,
-        dt=dt,
-    )
+    if publish_times:
+        traj_msg = _build_timed_joint_trajectory(
+            joint_names=publish_joint_names,
+            positions=publish_path,
+            velocities=publish_arm_velocities,
+            accelerations=publish_arm_accelerations,
+            times=publish_times,
+        )
+    else:
+        traj_msg = _build_joint_trajectory(
+            publish_path,
+            publish_joint_names,
+            dt=dt,
+        )
     repeats = max(1, int(args.publish_repeat))
+    duration_s = publish_times[-1] if publish_times else (len(publish_path) - 1) * dt
     print(
         "[ARM_DOOR][OPEN][REAL] "
         f"JointTrajectory -> {arm_topic}, base Twist -> {base_topic} "
-        f"(dt={dt:.3f}s, waypoints={len(publish_path)})"
+        f"(dt={dt:.3f}s, waypoints={len(publish_path)}, duration={duration_s:.3f}s)"
     )
     for i in range(repeats):
         traj_msg.header.stamp = _future_stamp(
@@ -2056,12 +2354,16 @@ def _publish_real_opening_path_with_base(
 
     max_linear = float(args.real_base_max_linear_mps)
     max_angular = float(args.real_base_max_angular_rps)
+    cmd_period = 1.0 / max(1.0, float(args.real_base_cmd_rate_hz))
     clamped_count = 0
     for idx in range(1, len(publish_base_poses)):
+        segment_dt = dt
+        if publish_times:
+            segment_dt = max(1.0e-3, float(publish_times[idx]) - float(publish_times[idx - 1]))
         vx, vy, wz, clamped = _base_pose_delta_to_body_twist(
             publish_base_poses[idx - 1],
             publish_base_poses[idx],
-            dt=dt,
+            dt=segment_dt,
             max_linear_mps=max_linear,
             max_angular_rps=max_angular,
         )
@@ -2070,9 +2372,13 @@ def _publish_real_opening_path_with_base(
         msg.linear.x = float(vx)
         msg.linear.y = float(vy)
         msg.angular.z = float(wz)
-        base_pub.publish(msg)
-        rclpy.spin_once(node, timeout_sec=0.0)
-        time.sleep(dt)
+        segment_end = time.monotonic() + segment_dt
+        while rclpy.ok() and time.monotonic() < segment_end:
+            base_pub.publish(msg)
+            rclpy.spin_once(node, timeout_sec=0.0)
+            remaining = segment_end - time.monotonic()
+            if remaining > 0.0:
+                time.sleep(min(cmd_period, remaining))
 
     stop_msg = Twist()
     stop_end = time.monotonic() + max(0.0, float(args.real_base_stop_duration_s))
