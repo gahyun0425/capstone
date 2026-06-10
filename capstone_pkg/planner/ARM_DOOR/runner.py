@@ -252,6 +252,30 @@ def _build_arm_door_parser():
         default=0.0,
         help="optional cap for retimed opening duration; <=0 leaves TOPP duration unconstrained",
     )
+    ap.add_argument(
+        "--door_open_wbc_qp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="run a velocity-level QP rollout over the planned opening base+arm path before publishing",
+    )
+    ap.add_argument(
+        "--door_open_wbc_qp_backend",
+        choices=("auto", "osqp", "scipy"),
+        default="osqp",
+        help="QP backend: auto uses OSQP when installed, otherwise scipy SLSQP",
+    )
+    ap.add_argument(
+        "--door_open_wbc_qp_hard_constraint",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="treat the gripper/handle velocity task as a hard equality constraint; soft weighted tracking is the default",
+    )
+    ap.add_argument("--door_open_wbc_qp_kp_pos", type=float, default=2.0)
+    ap.add_argument("--door_open_wbc_qp_kp_rot", type=float, default=2.0)
+    ap.add_argument("--door_open_wbc_qp_task_weight", type=float, default=100.0)
+    ap.add_argument("--door_open_wbc_qp_base_ref_weight", type=float, default=1.0)
+    ap.add_argument("--door_open_wbc_qp_joint_ref_weight", type=float, default=1.0)
+    ap.add_argument("--door_open_wbc_qp_joint_reg_weight", type=float, default=1.0e-3)
     ap.add_argument("--door_open_base_pose_topic", default="/base_pose_cmd")
     ap.add_argument(
         "--real_base_cmd_vel_topic",
@@ -2224,6 +2248,7 @@ def _publish_real_opening_path_with_base(
     joint_names,
     path,
     base_poses,
+    desired_ee_poses=None,
 ) -> None:
     from capstone_pkg.planner.arm_rrt_common.path_publisher import (
         _build_joint_trajectory,
@@ -2264,6 +2289,50 @@ def _publish_real_opening_path_with_base(
         print(
             "[ARM_DOOR][OPEN][REAL][BASE] "
             f"smoothed base publish poses window={smooth_window} changed={changed_count}/{len(publish_base_poses)}"
+        )
+
+    if bool(getattr(args, "door_open_wbc_qp", False)):
+        if desired_ee_poses is None:
+            raise RuntimeError("door_open_wbc_qp requires desired opening EE poses")
+        if len(desired_ee_poses) != len(publish_path):
+            raise RuntimeError("door_open_wbc_qp desired EE pose length does not match path length")
+        from capstone_pkg.utils.config import LEFT_EE_FRAME, RIGHT_EE_FRAME, ROBOT_URDF
+        from capstone_pkg.wbc.door_qp import DoorOpeningWBCQP, DoorWBCQPConfig
+
+        ee_frame = LEFT_EE_FRAME if arm == "left" else RIGHT_EE_FRAME
+        qp = DoorOpeningWBCQP(
+            DoorWBCQPConfig(
+                urdf_path=str(ROBOT_URDF),
+                ee_frame=str(ee_frame),
+                joint_limit_yml=str(args.joint_limit_yml),
+                dt=max(1.0e-3, float(args.door_open_dt)),
+                max_base_linear_mps=max(1.0e-6, float(args.real_base_max_linear_mps)),
+                max_base_angular_rps=max(1.0e-6, float(args.real_base_max_angular_rps)),
+                max_joint_velocity=max(1.0e-6, float(args.door_open_topp_arm_max_velocity)),
+                kp_pos=float(args.door_open_wbc_qp_kp_pos),
+                kp_rot=float(args.door_open_wbc_qp_kp_rot),
+                task_weight=max(1.0e-9, float(args.door_open_wbc_qp_task_weight)),
+                base_ref_weight=max(0.0, float(args.door_open_wbc_qp_base_ref_weight)),
+                joint_ref_weight=max(0.0, float(args.door_open_wbc_qp_joint_ref_weight)),
+                joint_reg_weight=max(0.0, float(args.door_open_wbc_qp_joint_reg_weight)),
+                hard_task_constraint=bool(args.door_open_wbc_qp_hard_constraint),
+                backend=str(args.door_open_wbc_qp_backend),
+            )
+        )
+        result = qp.rollout(
+            joint_names=publish_joint_names,
+            joint_path=publish_path,
+            base_poses=publish_base_poses,
+            desired_ee_poses=desired_ee_poses,
+        )
+        publish_path = result.joint_path
+        publish_base_poses = result.base_poses
+        max_task_error = max(result.task_error_norms) if result.task_error_norms else 0.0
+        print(
+            "[ARM_DOOR][OPEN][REAL][WBC-QP] "
+            f"backend={result.used_backend or str(args.door_open_wbc_qp_backend)} "
+            f"hard_constraint={bool(args.door_open_wbc_qp_hard_constraint)} "
+            f"waypoints={len(publish_path)} max_task_error={max_task_error:.6f}"
         )
 
     if bool(getattr(args, "door_open_topp", True)):
@@ -2426,12 +2495,27 @@ def _publish_real_opening_path_with_base(
         rclpy.shutdown()
 
 
-def _publish_opening_path(args, arm: str, joint_names, path, door_alphas_rad, base_poses=None) -> None:
+def _publish_opening_path(
+    args,
+    arm: str,
+    joint_names,
+    path,
+    door_alphas_rad,
+    base_poses=None,
+    desired_ee_poses=None,
+) -> None:
     from capstone_pkg.planner.arm_rrt_common.path_publisher import publish_joint_path
 
     if args.publish_mode == "real":
         if base_poses is not None and bool(args.door_open_base_assist):
-            _publish_real_opening_path_with_base(args, arm, joint_names, path, base_poses)
+            _publish_real_opening_path_with_base(
+                args,
+                arm,
+                joint_names,
+                path,
+                base_poses,
+                desired_ee_poses=desired_ee_poses,
+            )
             return
         _publish_real_path(args, arm, joint_names, path)
         return
@@ -2758,6 +2842,7 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
                         open_path,
                         open_alphas,
                         open_base_poses,
+                        desired_ee_poses=open_desired_ee_poses,
                     )
                 except RuntimeError as exc:
                     print(f"[ARM_DOOR][OPEN] {exc}")
