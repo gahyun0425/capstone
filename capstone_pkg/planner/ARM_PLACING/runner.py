@@ -45,11 +45,11 @@ from capstone_pkg.utils.world_collision_bridge import (
 
 _ARM_TARGETS = {
     "left": {
-        "position": (0.5, 0.1, 1.1),
+        "position": (0.5, 0.1, 1.0),
         "orientation_xyzw": (1.0, 0.0, 0.0, 0.0),
     },
     "right": {
-        "position": (0.5, -0.1, 1.1),
+        "position": (0.5, -0.1, 1.0),
         "orientation_xyzw": (1.0, 0.0, 0.0, 0.0),
     },
 }

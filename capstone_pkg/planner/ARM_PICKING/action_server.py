@@ -24,6 +24,11 @@ from capstone_pkg.planner.arm_rrt_common.path_publisher import (
     send_joint_trajectory_action_group,
     wait_for_joint_positions,
 )
+from capstone_pkg.planner.arm_rrt_common.plot import (
+    save_ee_path_plot_3d_matplotlib,
+    save_ee_path_plot_matplotlib,
+    save_joint_path_plot_matplotlib,
+)
 from capstone_pkg.planner.arm_rrt_common.single_arm_motion import (
     SingleArmMotionPlan,
     normalize_arm_name,
@@ -42,8 +47,10 @@ from capstone_pkg.planner.arm_rrt_common.single_arm_runner import (
     build_single_arm_parser,
 )
 from capstone_pkg.utils.config import (
+    LEFT_EE_FRAME,
     LEFT_JOINTS,
     LONG_SHELF_YAML,
+    RIGHT_EE_FRAME,
     RIGHT_JOINTS,
     SHELF_YAML,
 )
@@ -257,6 +264,10 @@ def _build_post_grasp_staging_pose(arm: str, base_pose: Pose) -> Pose:
 
 def _arm_joint_names(arm: str) -> list[str]:
     return list(LEFT_JOINTS if arm == "left" else RIGHT_JOINTS)
+
+
+def _arm_ee_frame(arm: str) -> str:
+    return LEFT_EE_FRAME if normalize_arm_name(arm) == "left" else RIGHT_EE_FRAME
 
 
 def _extract_joint_positions(
@@ -1185,6 +1196,7 @@ class ArmPickingCoordinator(Node):
             f"planning_time={planning_time_s:.3f}s "
             f"target_xyz={_pose_position_xyz(target_pose)}"
         )
+        self._maybe_save_single_arm_plot(stage=stage, plan=plan, world_yml=world_yml)
         return plan
 
     def _plan_other_arm_zero(
@@ -1237,6 +1249,7 @@ class ArmPickingCoordinator(Node):
             f"stage={stage} arm={normalized_arm} waypoints={len(plan.spline_path)} "
             f"planning_time={planning_time_s:.3f}s goal=zero_pose"
         )
+        self._maybe_save_single_arm_plot(stage=stage, plan=plan, world_yml=world_yml)
         return plan
 
     def _plan_selected_arm_to_q_goal(
@@ -1294,6 +1307,7 @@ class ArmPickingCoordinator(Node):
             f"stage={stage} arm={normalized_arm} waypoints={len(plan.spline_path)} "
             f"planning_time={planning_time_s:.3f}s"
         )
+        self._maybe_save_single_arm_plot(stage=stage, plan=plan, world_yml=world_yml)
         return plan
 
     def _plan_selected_arm_fixed_ee_z(
@@ -1398,6 +1412,7 @@ class ArmPickingCoordinator(Node):
             f"stage={stage} arm={normalized_arm} waypoints={len(plan.spline_path)} "
             f"planning_time={planning_time_s:.3f}s target_xyz={target_xyz}"
         )
+        self._maybe_save_single_arm_plot(stage=stage, plan=plan, world_yml=world_yml)
         return plan
 
     def _publish_single_arm_joint_path(
@@ -1896,7 +1911,133 @@ class ArmPickingCoordinator(Node):
             f"{max_attempts} attempt(s); {last_failure}"
         )
 
+    def _maybe_save_single_arm_plot(
+        self,
+        *,
+        stage: str,
+        plan: SingleArmMotionPlan,
+        world_yml: str | None,
+    ) -> None:
+        if not bool(getattr(self._args, "plot", False)):
+            return
+        arm = normalize_arm_name(plan.arm)
+        joint_names = _arm_joint_names(arm)
+        joint_path = _build_active_joint_path(
+            plan.spline_path,
+            plan.cspace_joint_names,
+            joint_names,
+        )
+        try:
+            out_png = save_ee_path_plot_matplotlib(
+                joint_path,
+                joint_names,
+                ee_frames=[(f"{arm} EE", _arm_ee_frame(arm))],
+                robot_yml=str(self._args.robot_yml),
+                world_yml=world_yml,
+                out_png=str(getattr(self._args, "plot_output", "")),
+                prefix=f"arm_picking_{stage}_{arm}_path_ee",
+                title=f"ARM_PICKING {stage} {arm} End-Effector Path",
+                cpu=bool(self._args.cpu),
+            )
+            self.get_logger().info(f"[PLOT] saved {stage} path png: {out_png}")
+            try:
+                out_png_3d = save_ee_path_plot_3d_matplotlib(
+                    joint_path,
+                    joint_names,
+                    ee_frames=[(f"{arm} EE", _arm_ee_frame(arm))],
+                    robot_yml=str(self._args.robot_yml),
+                    world_yml=world_yml,
+                    out_png=str(getattr(self._args, "plot_output", "")),
+                    prefix=f"arm_picking_{stage}_{arm}_path_ee_3d",
+                    title=f"ARM_PICKING {stage} {arm} End-Effector Path 3D",
+                    cpu=bool(self._args.cpu),
+                )
+                self.get_logger().info(f"[PLOT] saved {stage} 3D path png: {out_png_3d}")
+            except Exception as exc:
+                self.get_logger().warning(f"[PLOT] 3D-only EE path plot failed for {stage}: {exc}")
+        except Exception as exc:
+            self.get_logger().warning(f"[PLOT] EE path plot failed for {stage}: {exc}")
+            try:
+                out_png = save_joint_path_plot_matplotlib(
+                    joint_path,
+                    joint_names,
+                    out_png=str(getattr(self._args, "plot_output", "")),
+                    prefix=f"arm_picking_{stage}_{arm}_joint_path",
+                    title=f"ARM_PICKING {stage} {arm} Joint Path",
+                    x_step=float(self._args.plot_x_step),
+                    y_scale=float(self._args.plot_y_scale),
+                    z_separation=float(self._args.plot_z_sep),
+                )
+                self.get_logger().info(f"[PLOT] saved fallback joint png: {out_png}")
+            except Exception as fallback_exc:
+                self.get_logger().warning(
+                    f"[PLOT] joint fallback plot failed for {stage}: {fallback_exc}"
+                )
+
+    def _maybe_save_full_path_plot(
+        self,
+        *,
+        stage: str,
+        full_path: Sequence[Sequence[float]],
+        cspace_joint_names: Sequence[str],
+        world_yml: str | None,
+    ) -> None:
+        if not bool(getattr(self._args, "plot", False)):
+            return
+        try:
+            out_png = save_ee_path_plot_matplotlib(
+                full_path,
+                cspace_joint_names,
+                ee_frames=[("Left EE", LEFT_EE_FRAME), ("Right EE", RIGHT_EE_FRAME)],
+                robot_yml=str(self._args.robot_yml),
+                world_yml=world_yml,
+                out_png=str(getattr(self._args, "plot_output", "")),
+                prefix=f"arm_picking_{stage}_path_ee",
+                title=f"ARM_PICKING {stage} End-Effector Path",
+                cpu=bool(self._args.cpu),
+            )
+            self.get_logger().info(f"[PLOT] saved {stage} full path png: {out_png}")
+            try:
+                out_png_3d = save_ee_path_plot_3d_matplotlib(
+                    full_path,
+                    cspace_joint_names,
+                    ee_frames=[("Left EE", LEFT_EE_FRAME), ("Right EE", RIGHT_EE_FRAME)],
+                    robot_yml=str(self._args.robot_yml),
+                    world_yml=world_yml,
+                    out_png=str(getattr(self._args, "plot_output", "")),
+                    prefix=f"arm_picking_{stage}_path_ee_3d",
+                    title=f"ARM_PICKING {stage} End-Effector Path 3D",
+                    cpu=bool(self._args.cpu),
+                )
+                self.get_logger().info(f"[PLOT] saved {stage} full 3D path png: {out_png_3d}")
+            except Exception as exc:
+                self.get_logger().warning(f"[PLOT] full 3D-only EE path plot failed for {stage}: {exc}")
+        except Exception as exc:
+            self.get_logger().warning(f"[PLOT] full EE path plot failed for {stage}: {exc}")
+            try:
+                out_png = save_joint_path_plot_matplotlib(
+                    full_path,
+                    cspace_joint_names,
+                    out_png=str(getattr(self._args, "plot_output", "")),
+                    prefix=f"arm_picking_{stage}_joint_path",
+                    title=f"ARM_PICKING {stage} Joint Path",
+                    x_step=float(self._args.plot_x_step),
+                    y_scale=float(self._args.plot_y_scale),
+                    z_separation=float(self._args.plot_z_sep),
+                )
+                self.get_logger().info(f"[PLOT] saved fallback full joint png: {out_png}")
+            except Exception as fallback_exc:
+                self.get_logger().warning(
+                    f"[PLOT] full joint fallback plot failed for {stage}: {fallback_exc}"
+                )
+
     def _maybe_save_alignment(self, record: AlignExecutionRecord) -> None:
+        self._maybe_save_full_path_plot(
+            stage="align",
+            full_path=record.full_path,
+            cspace_joint_names=record.cspace_joint_names,
+            world_yml=record.world_yml,
+        )
         save_path = str(getattr(self._args, "save", "") or "").strip()
         if not save_path:
             return

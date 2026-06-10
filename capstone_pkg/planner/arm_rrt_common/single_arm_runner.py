@@ -323,7 +323,8 @@ def build_single_arm_parser(
     ap.add_argument("--gripper_delay_s", type=float, default=3.0, help="delay [s] after trajectory execution before gripper command")
     ap.add_argument("--gripper_target", type=float, default=1.0, help="target command value for selected gripper joint")
     ap.add_argument("--plot_path", action=argparse.BooleanOptionalAction, default=True, help="publish planned path as RViz2 MarkerArray plot")
-    ap.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False, help="show planned path in a matplotlib window")
+    ap.add_argument("--plot", action=argparse.BooleanOptionalAction, default=False, help="save planned end-effector path as a PNG")
+    ap.add_argument("--plot_output", default="", help="PNG file or directory used by --plot; empty creates an auto-named file in cwd")
     ap.add_argument("--plot_topic", default="/arm_rrt/joint_path_plot", help="topic for RViz2 MarkerArray plot")
     ap.add_argument("--plot_frame", default="map", help="frame_id for RViz2 plot markers")
     ap.add_argument("--plot_x_step", type=float, default=0.05, help="x-axis spacing between waypoints [m]")
@@ -400,7 +401,9 @@ def main_single_arm(
     )
     from capstone_pkg.planner.arm_rrt_common.plot import (
         publish_joint_path_plot,
-        show_joint_path_plot_matplotlib,
+        save_ee_path_plot_3d_matplotlib,
+        save_ee_path_plot_matplotlib,
+        save_joint_path_plot_matplotlib,
     )
     from capstone_pkg.planner.tbrrt.batch.single_arm_batch_conext import (
         plan_single_arm_tbrrt_batch_conext,
@@ -692,18 +695,52 @@ def main_single_arm(
         print("[PLOT] done.")
 
     if args.plot:
-        print("[PLOT] Showing matplotlib joint path window...")
+        ee_frame = LEFT_EE_FRAME if arm == "left" else RIGHT_EE_FRAME
+        print("[PLOT] Saving end-effector path PNG...")
         try:
-            show_joint_path_plot_matplotlib(
+            out_png = save_ee_path_plot_matplotlib(
                 pub_path,
                 pub_names,
-                x_step=float(args.plot_x_step),
-                y_scale=float(args.plot_y_scale),
-                z_separation=float(args.plot_z_sep),
-                title=f"{planner_name} Joint Path",
+                ee_frames=[(f"{arm} EE", ee_frame)],
+                robot_yml=str(args.robot_yml),
+                world_yml=object_world_yml,
+                out_png=str(args.plot_output),
+                prefix=f"{planner_name.lower()}_{arm}_path_ee",
+                title=f"{planner_name} {arm} End-Effector Path",
+                cpu=bool(args.cpu),
             )
+            print(f"[PLOT] saved: {out_png}")
+            try:
+                out_png_3d = save_ee_path_plot_3d_matplotlib(
+                    pub_path,
+                    pub_names,
+                    ee_frames=[(f"{arm} EE", ee_frame)],
+                    robot_yml=str(args.robot_yml),
+                    world_yml=object_world_yml,
+                    out_png=str(args.plot_output),
+                    prefix=f"{planner_name.lower()}_{arm}_path_ee_3d",
+                    title=f"{planner_name} {arm} End-Effector Path 3D",
+                    cpu=bool(args.cpu),
+                )
+                print(f"[PLOT] saved 3D: {out_png_3d}")
+            except Exception as exc:
+                print(f"[PLOT] 3D-only EE path plot failed: {exc}")
         except Exception as exc:
-            print(f"[PLOT] matplotlib plot failed: {exc}")
-            return 1
+            print(f"[PLOT] EE path plot failed: {exc}")
+            try:
+                out_png = save_joint_path_plot_matplotlib(
+                    pub_path,
+                    pub_names,
+                    out_png=str(args.plot_output),
+                    prefix=f"{planner_name.lower()}_{arm}_joint_path",
+                    title=f"{planner_name} {arm} Joint Path",
+                    x_step=float(args.plot_x_step),
+                    y_scale=float(args.plot_y_scale),
+                    z_separation=float(args.plot_z_sep),
+                )
+                print(f"[PLOT] saved fallback joint plot: {out_png}")
+            except Exception as fallback_exc:
+                print(f"[PLOT] matplotlib plot failed: {fallback_exc}")
+                return 1
 
     return 0

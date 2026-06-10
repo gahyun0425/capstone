@@ -15,6 +15,7 @@ PHASE_FRONT = 2
 class BaseDoorGraphConfig:
     steps: int
     goal_alpha_rad: float
+    lambda_step_rad: float
     base_motion_start_alpha_rad: float
     closed_handle_xyz: tuple[float, float, float]
     door_hinge_xyz: tuple[float, float, float]
@@ -55,6 +56,7 @@ class BaseDoorGraphPlan:
     generated: int
     rejected_collision: int
     rejected_reach: int
+    rejected_lambda_overlap: int
 
 
 def _wrap_pi(angle: float) -> float:
@@ -132,6 +134,29 @@ def _alpha_from_idx(alpha_idx: int, cfg: BaseDoorGraphConfig) -> float:
     if cfg.steps <= 0:
         return 0.0
     return cfg.goal_alpha_rad * float(alpha_idx) / float(cfg.steps)
+
+
+def _alpha_key(alpha_rad: float) -> int:
+    return int(round(float(alpha_rad) * 1.0e6))
+
+
+def _alpha_grid(cfg: BaseDoorGraphConfig) -> list[float]:
+    goal = float(cfg.goal_alpha_rad)
+    if abs(goal) <= 1.0e-12:
+        return [0.0]
+    step = max(1.0e-6, abs(float(cfg.lambda_step_rad)))
+    n = max(1, int(math.ceil(abs(goal) / step)))
+    values = [goal * float(i) / float(n) for i in range(n + 1)]
+    values.extend(_alpha_from_idx(i, cfg) for i in range(cfg.steps + 1))
+    out: list[float] = []
+    seen: set[int] = set()
+    for value in sorted(values):
+        key = _alpha_key(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(float(value))
+    return out
 
 
 def _front_goal_distance(cfg: BaseDoorGraphConfig, pose_xyyaw: Sequence[float]) -> tuple[float, float]:
@@ -279,6 +304,84 @@ def _base_collision_cost(
     return True, 0.05 / max(0.02, min_clearance + 0.02)
 
 
+LambdaEntry = tuple[float, float]
+LambdaCache = dict[tuple[int, int, int], list[LambdaEntry]]
+State = tuple[int, int, int, int, int]
+
+
+def _lambda_for_pose(
+    cfg: BaseDoorGraphConfig,
+    *,
+    pose_xyyaw: Sequence[float],
+    pose_key: tuple[int, int, int],
+    alpha_grid: Sequence[float],
+    cache: LambdaCache,
+) -> list[LambdaEntry]:
+    # Chitta et al., ICRA 2010 Sec. IV-A: Lambda(s) is the set of door
+    # angles that keep the handle reachable and the door/base collision-free.
+    cached = cache.get(pose_key)
+    if cached is not None:
+        return cached
+
+    entries: list[LambdaEntry] = []
+    for alpha in alpha_grid:
+        reachable, reach_cost = _reach_cost(cfg, pose_xyyaw=pose_xyyaw, alpha_rad=float(alpha))
+        if not reachable:
+            continue
+        collision_free, collision_cost = _base_collision_cost(
+            cfg,
+            pose_xyyaw=pose_xyyaw,
+            alpha_rad=float(alpha),
+        )
+        if not collision_free:
+            continue
+        entries.append((float(alpha), float(reach_cost) + float(collision_cost)))
+
+    cache[pose_key] = entries
+    return entries
+
+
+def _lambda_for_state(
+    state: State,
+    cfg: BaseDoorGraphConfig,
+    *,
+    alpha_grid: Sequence[float],
+    cache: LambdaCache,
+) -> list[LambdaEntry]:
+    pose = _state_to_pose(state, cfg)
+    return _lambda_for_pose(
+        cfg,
+        pose_xyyaw=pose,
+        pose_key=(state[0], state[1], state[2]),
+        alpha_grid=alpha_grid,
+        cache=cache,
+    )
+
+
+def _lambda_cost_at_alpha(entries: Sequence[LambdaEntry], alpha_rad: float) -> float | None:
+    key = _alpha_key(alpha_rad)
+    for alpha, cost in entries:
+        if _alpha_key(alpha) == key:
+            return float(cost)
+    return None
+
+
+def _lambda_overlap_cost(
+    parent_entries: Sequence[LambdaEntry],
+    child_entries: Sequence[LambdaEntry],
+) -> float | None:
+    parent_by_alpha = {_alpha_key(alpha): float(cost) for alpha, cost in parent_entries}
+    best: float | None = None
+    for alpha, child_cost in child_entries:
+        parent_cost = parent_by_alpha.get(_alpha_key(alpha))
+        if parent_cost is None:
+            continue
+        overlap_cost = 0.5 * (parent_cost + float(child_cost))
+        if best is None or overlap_cost < best:
+            best = overlap_cost
+    return best
+
+
 def _successor_actions(cfg: BaseDoorGraphConfig) -> list[tuple[int, int, int]]:
     actions: list[tuple[int, int, int]] = []
     for dx in (-1, 0, 1):
@@ -290,11 +393,11 @@ def _successor_actions(cfg: BaseDoorGraphConfig) -> list[tuple[int, int, int]]:
 
 
 def _successors(
-    state: tuple[int, int, int, int, int],
+    state: State,
     cfg: BaseDoorGraphConfig,
-) -> list[tuple[tuple[int, int, int, int, int], float]]:
+) -> list[tuple[State, float]]:
     ix, iy, iyaw, alpha_idx, phase = state
-    out: list[tuple[tuple[int, int, int, int, int], float]] = []
+    out: list[tuple[State, float]] = []
     if phase == PHASE_APPROACH:
         next_alpha = min(cfg.steps, alpha_idx + 1)
         next_phase = PHASE_OPENING
@@ -318,8 +421,11 @@ def _successors(
 
 
 def _valid_state_cost(
-    state: tuple[int, int, int, int, int],
+    state: State,
     cfg: BaseDoorGraphConfig,
+    *,
+    alpha_grid: Sequence[float],
+    cache: LambdaCache,
 ) -> tuple[bool, float, str]:
     pose = _state_to_pose(state, cfg)
     alpha = _alpha_from_idx(state[3], cfg)
@@ -332,10 +438,14 @@ def _valid_state_cost(
     collision_free, collision_cost = _base_collision_cost(cfg, pose_xyyaw=pose, alpha_rad=alpha)
     if not collision_free:
         return False, 0.0, "collision"
-    return True, reach_cost + collision_cost, ""
+    lambda_entries = _lambda_for_state(state, cfg, alpha_grid=alpha_grid, cache=cache)
+    target_cost = _lambda_cost_at_alpha(lambda_entries, alpha)
+    if target_cost is None:
+        return False, 0.0, "lambda"
+    return True, float(target_cost), ""
 
 
-def _heuristic(state: tuple[int, int, int, int, int], cfg: BaseDoorGraphConfig) -> float:
+def _heuristic(state: State, cfg: BaseDoorGraphConfig) -> float:
     pose = _state_to_pose(state, cfg)
     dist_xy, dist_yaw = _front_goal_distance(cfg, pose)
     alpha_remaining = max(0, cfg.steps - int(state[3]))
@@ -367,15 +477,15 @@ def _layer_candidate_states(
     cfg: BaseDoorGraphConfig,
     *,
     alpha_idx: int,
-) -> list[tuple[int, int, int, int, int]]:
+) -> list[State]:
     alpha = _alpha_from_idx(alpha_idx, cfg)
     center, span = _opening_center_span(cfg, alpha)
     xs = _axis_samples(center[0], span[0], cfg.xy_step_m)
     ys = _axis_samples(center[1], span[1], cfg.xy_step_m)
     yaws = _axis_samples(center[2], span[2], cfg.yaw_step_rad)
 
-    states: list[tuple[int, int, int, int, int]] = []
-    seen: set[tuple[int, int, int, int, int]] = set()
+    states: list[State] = []
+    seen: set[State] = set()
 
     def _add(pose: Sequence[float], phase: int) -> None:
         ix, iy, iyaw = _pose_to_indices(pose, cfg)
@@ -394,7 +504,7 @@ def _layer_candidate_states(
     if alpha_idx >= cfg.steps:
         _add(cfg.front_goal_xyyaw, PHASE_FRONT)
 
-    def _rank(state: tuple[int, int, int, int, int]) -> float:
+    def _rank(state: State) -> float:
         pose = _state_to_pose(state, cfg)
         dist_center = math.sqrt(
             (pose[0] - center[0]) ** 2
@@ -420,8 +530,8 @@ def _layer_candidate_states(
 
 def _state_transition_cost(
     cfg: BaseDoorGraphConfig,
-    parent: tuple[int, int, int, int, int],
-    child: tuple[int, int, int, int, int],
+    parent: State,
+    child: State,
 ) -> float:
     p0 = _state_to_pose(parent, cfg)
     p1 = _state_to_pose(child, cfg)
@@ -435,28 +545,39 @@ def _state_transition_cost(
 def plan_base_door_graph(cfg: BaseDoorGraphConfig) -> BaseDoorGraphPlan:
     steps = max(2, int(cfg.steps))
     cfg = BaseDoorGraphConfig(**{**cfg.__dict__, "steps": steps})
+    alpha_grid = _alpha_grid(cfg)
+    lambda_cache: LambdaCache = {}
     start_idx = _pose_to_indices(cfg.start_base_xyyaw, cfg)
     start_state = (start_idx[0], start_idx[1], start_idx[2], 0, PHASE_APPROACH)
-    ok, start_extra_cost, reason = _valid_state_cost(start_state, cfg)
+    ok, start_extra_cost, reason = _valid_state_cost(
+        start_state,
+        cfg,
+        alpha_grid=alpha_grid,
+        cache=lambda_cache,
+    )
     if not ok:
         raise RuntimeError(f"base-door graph start state is invalid: {reason}")
 
-    previous: list[tuple[float, tuple[int, int, int, int, int], list[tuple[int, int, int, int, int]]]] = [
+    previous: list[tuple[float, State, list[State]]] = [
         (start_extra_cost, start_state, [])
     ]
     generated = 0
     expanded = 0
     rejected_collision = 0
     rejected_reach = 0
+    rejected_lambda_overlap = 0
 
     for alpha_idx in range(1, cfg.steps + 1):
         candidates = _layer_candidate_states(cfg, alpha_idx=alpha_idx)
-        next_layer: list[
-            tuple[float, tuple[int, int, int, int, int], list[tuple[int, int, int, int, int]]]
-        ] = []
+        next_layer: list[tuple[float, State, list[State]]] = []
         for child in candidates:
             generated += 1
-            ok, state_cost, reason = _valid_state_cost(child, cfg)
+            ok, state_cost, reason = _valid_state_cost(
+                child,
+                cfg,
+                alpha_grid=alpha_grid,
+                cache=lambda_cache,
+            )
             if not ok:
                 if reason == "collision":
                     rejected_collision += 1
@@ -469,8 +590,25 @@ def plan_base_door_graph(cfg: BaseDoorGraphConfig) -> BaseDoorGraphPlan:
                 expanded += 1
                 if expanded > cfg.max_expansions:
                     break
+                overlap_cost = _lambda_overlap_cost(
+                    _lambda_for_state(
+                        parent_state,
+                        cfg,
+                        alpha_grid=alpha_grid,
+                        cache=lambda_cache,
+                    ),
+                    _lambda_for_state(
+                        child,
+                        cfg,
+                        alpha_grid=alpha_grid,
+                        cache=lambda_cache,
+                    ),
+                )
+                if overlap_cost is None:
+                    rejected_lambda_overlap += 1
+                    continue
                 edge_cost = _state_transition_cost(cfg, parent_state, child)
-                cost = parent_cost + edge_cost + state_cost
+                cost = parent_cost + edge_cost + state_cost + 0.2 * float(overlap_cost)
                 if best_item is None or cost < best_item[0]:
                     best_item = (cost, child, parent_path + [child])
             if expanded > cfg.max_expansions:
@@ -484,7 +622,8 @@ def plan_base_door_graph(cfg: BaseDoorGraphConfig) -> BaseDoorGraphPlan:
                 "base-door graph failed: "
                 f"alpha_idx={alpha_idx}/{cfg.steps} generated={generated} "
                 f"expanded={expanded} rejected_collision={rejected_collision} "
-                f"rejected_reach={rejected_reach}"
+                f"rejected_reach={rejected_reach} "
+                f"rejected_lambda_overlap={rejected_lambda_overlap}"
             )
         next_layer.sort(key=lambda item: item[0] + _heuristic(item[1], cfg))
         previous = next_layer[: max(1, int(cfg.layer_keep))]
@@ -493,7 +632,7 @@ def plan_base_door_graph(cfg: BaseDoorGraphConfig) -> BaseDoorGraphPlan:
         raise RuntimeError(
             "base-door graph failed: "
             f"expanded={expanded} generated={generated} rejected_collision={rejected_collision} "
-            f"rejected_reach={rejected_reach}"
+            f"rejected_reach={rejected_reach} rejected_lambda_overlap={rejected_lambda_overlap}"
         )
 
     goal_items = [
@@ -507,7 +646,8 @@ def plan_base_door_graph(cfg: BaseDoorGraphConfig) -> BaseDoorGraphPlan:
             "base-door graph failed to reach fridge-front goal: "
             f"best_dist={dist_xy:.3f}m best_yaw={math.degrees(dist_yaw):.1f}deg "
             f"expanded={expanded} generated={generated} "
-            f"rejected_collision={rejected_collision} rejected_reach={rejected_reach}"
+            f"rejected_collision={rejected_collision} rejected_reach={rejected_reach} "
+            f"rejected_lambda_overlap={rejected_lambda_overlap}"
         )
     goal_items.sort(key=lambda item: item[0])
     best_cost, _, states = goal_items[0]
@@ -529,4 +669,5 @@ def plan_base_door_graph(cfg: BaseDoorGraphConfig) -> BaseDoorGraphPlan:
         generated=generated,
         rejected_collision=rejected_collision,
         rejected_reach=rejected_reach,
+        rejected_lambda_overlap=rejected_lambda_overlap,
     )

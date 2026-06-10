@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import colorsys
+import math
+from datetime import datetime
+from pathlib import Path
+import re
 import time
-from typing import Sequence, Tuple
+from typing import Any, Sequence, Tuple
 
 import rclpy
 from builtin_interfaces.msg import Duration
@@ -43,14 +47,637 @@ def _compute_fk_points(
 ) -> list[Tuple[float, float, float]]:
     from capstone_pkg.kinematics.curobo_test_fk import compute_relative_link_path_from_cspace
 
-    return compute_relative_link_path_from_cspace(
+    try:
+        return compute_relative_link_path_from_cspace(
+            path,
+            joint_names,
+            robot_yml=robot_yml,
+            base_link=base_frame,
+            ee_link=ee_frame,
+            cpu=cpu,
+        )
+    except Exception:
+        return _compute_fk_points_urdf(
+            path,
+            joint_names,
+            robot_yml=robot_yml,
+            base_frame=base_frame,
+            ee_frame=ee_frame,
+        )
+
+
+def _resolve_urdf_path_from_robot_yml(robot_yml: str) -> str:
+    import yaml
+
+    with open(str(robot_yml), "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+    kin = ((cfg.get("robot_cfg") or {}).get("kinematics") or {})
+    urdf_path = kin.get("urdf_path", "")
+    if not isinstance(urdf_path, str) or not urdf_path:
+        raise RuntimeError(f"robot_yml has no robot_cfg.kinematics.urdf_path: {robot_yml}")
+
+    candidates = []
+    raw = Path(urdf_path).expanduser()
+    candidates.append(raw)
+    asset_root = kin.get("asset_root_path", "")
+    if isinstance(asset_root, str) and asset_root:
+        candidates.append(Path(asset_root).expanduser() / urdf_path)
+    candidates.append(Path(robot_yml).expanduser().parent / urdf_path)
+
+    for cand in candidates:
+        if cand.is_file():
+            return str(cand)
+    raise FileNotFoundError(f"URDF not found from robot_yml={robot_yml}: {urdf_path}")
+
+
+def _compute_fk_points_urdf(
+    path: Sequence[Sequence[float]],
+    joint_names: Sequence[str],
+    *,
+    robot_yml: str,
+    base_frame: str,
+    ee_frame: str,
+) -> list[Tuple[float, float, float]]:
+    from capstone_pkg.constraint_projection.bimanual_jacobian_compare_urdf import URDFModel
+
+    urdf_path = _resolve_urdf_path_from_robot_yml(robot_yml)
+    model = URDFModel(urdf_path)
+    out: list[Tuple[float, float, float]] = []
+
+    for waypoint_idx, q in enumerate(path):
+        if len(q) != len(joint_names):
+            raise ValueError(
+                f"path[{waypoint_idx}] length {len(q)} != len(joint_names) {len(joint_names)}"
+            )
+        q_vec = [float(v) for v in q]
+        T_ee, _ = model.fk_and_geometric_jacobian_world(
+            str(ee_frame),
+            q_vec,
+            [str(n) for n in joint_names],
+        )
+        T_base, _ = model.fk_and_geometric_jacobian_world(
+            str(base_frame),
+            q_vec,
+            [str(n) for n in joint_names],
+        )
+        rel = T_base[:3, :3].T @ (T_ee[:3, 3] - T_base[:3, 3])
+        out.append((float(rel[0]), float(rel[1]), float(rel[2])))
+    return out
+
+
+def _safe_plot_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name).strip())
+    return safe.strip("_") or "path"
+
+
+def resolve_plot_output_path(out_png: str | None, *, prefix: str, file_suffix: str = "") -> str:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename = f"{_safe_plot_name(prefix)}_{timestamp}.png"
+    raw = str(out_png or "").strip()
+    if not raw:
+        path = Path.cwd() / filename
+    else:
+        candidate = Path(raw).expanduser()
+        if candidate.suffix.lower() == ".png":
+            suffix = _safe_plot_name(file_suffix).strip("_")
+            path = candidate.with_name(f"{candidate.stem}_{suffix}{candidate.suffix}") if suffix else candidate
+        else:
+            path = candidate / filename
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return str(path)
+
+
+def _load_world_model(world_yml: str | None) -> dict[str, Any] | None:
+    if world_yml in (None, "", "none", "None"):
+        return None
+    try:
+        import yaml
+
+        with open(str(world_yml), "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _quat_wxyz_to_rotmat(q: Sequence[float]) -> list[list[float]]:
+    w, x, y, z = [float(v) for v in q[:4]]
+    norm = math.sqrt(w * w + x * x + y * y + z * z)
+    if norm < 1.0e-12:
+        w, x, y, z = 1.0, 0.0, 0.0, 0.0
+    else:
+        w, x, y, z = w / norm, x / norm, y / norm, z / norm
+    return [
+        [1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w)],
+        [2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w)],
+        [2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y)],
+    ]
+
+
+def _cuboid_corners(center_xyz: Sequence[float], dims_xyz: Sequence[float], quat_wxyz: Sequence[float]):
+    hx, hy, hz = [0.5 * float(v) for v in dims_xyz[:3]]
+    local = [
+        (-hx, -hy, -hz),
+        (hx, -hy, -hz),
+        (hx, hy, -hz),
+        (-hx, hy, -hz),
+        (-hx, -hy, hz),
+        (hx, -hy, hz),
+        (hx, hy, hz),
+        (-hx, hy, hz),
+    ]
+    rot = _quat_wxyz_to_rotmat(quat_wxyz)
+    cx, cy, cz = [float(v) for v in center_xyz[:3]]
+    out = []
+    for x, y, z in local:
+        out.append(
+            (
+                rot[0][0] * x + rot[0][1] * y + rot[0][2] * z + cx,
+                rot[1][0] * x + rot[1][1] * y + rot[1][2] * z + cy,
+                rot[2][0] * x + rot[2][1] * y + rot[2][2] * z + cz,
+            )
+        )
+    return out
+
+
+def _convex_hull_2d(points):
+    pts = sorted({(float(x), float(y)) for x, y in points})
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower = []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    upper = []
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def _draw_world_cuboids_2d(ax, world_model: dict[str, Any] | None, plane_axes: tuple[int, int]) -> None:
+    if not world_model:
+        return
+    try:
+        from matplotlib.patches import Polygon
+    except Exception:
+        return
+    cuboids = world_model.get("cuboid", {}) or {}
+    if not isinstance(cuboids, dict):
+        return
+    i0, i1 = plane_axes
+    for item in cuboids.values():
+        if not isinstance(item, dict) or "dims" not in item or "pose" not in item:
+            continue
+        pose = item.get("pose") or []
+        dims = item.get("dims") or []
+        if len(pose) < 7 or len(dims) < 3:
+            continue
+        corners = _cuboid_corners(pose[:3], dims[:3], pose[3:7])
+        hull = _convex_hull_2d([(p[i0], p[i1]) for p in corners])
+        if len(hull) >= 3:
+            ax.add_patch(
+                Polygon(
+                    hull,
+                    closed=True,
+                    alpha=0.12,
+                    linewidth=0.7,
+                    edgecolor=(0.70, 0.05, 0.02, 0.75),
+                    facecolor=(0.95, 0.20, 0.05, 0.18),
+                )
+            )
+
+
+def _world_cuboid_corners(world_model: dict[str, Any] | None) -> list[list[tuple[float, float, float]]]:
+    if not world_model:
+        return []
+    cuboids = world_model.get("cuboid", {}) or {}
+    if not isinstance(cuboids, dict):
+        return []
+
+    out: list[list[tuple[float, float, float]]] = []
+    for item in cuboids.values():
+        if not isinstance(item, dict) or "dims" not in item or "pose" not in item:
+            continue
+        pose = item.get("pose") or []
+        dims = item.get("dims") or []
+        if len(pose) < 7 or len(dims) < 3:
+            continue
+        out.append(_cuboid_corners(pose[:3], dims[:3], pose[3:7]))
+    return out
+
+
+def _draw_world_cuboids_3d(ax, world_model: dict[str, Any] | None) -> None:
+    try:
+        from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+    except Exception:
+        return
+
+    faces = [
+        [0, 1, 2, 3],
+        [4, 5, 6, 7],
+        [0, 1, 5, 4],
+        [1, 2, 6, 5],
+        [2, 3, 7, 6],
+        [3, 0, 4, 7],
+    ]
+    for corners in _world_cuboid_corners(world_model):
+        poly3d = [[corners[idx] for idx in face] for face in faces]
+        pc = Poly3DCollection(
+            poly3d,
+            alpha=0.18,
+            linewidths=0.7,
+            edgecolors=(0.70, 0.05, 0.02, 0.75),
+            facecolors=(0.95, 0.20, 0.05, 0.18),
+        )
+        ax.add_collection3d(pc)
+
+
+def _subsample_path(path: Sequence[Sequence[float]], max_points: int) -> list[list[float]]:
+    rows = [[float(v) for v in q] for q in path]
+    n = len(rows)
+    if max_points <= 0 or n <= max_points:
+        return rows
+    if max_points == 1:
+        return [rows[0]]
+    idxs = [
+        round(float(i) * float(n - 1) / float(max_points - 1))
+        for i in range(max_points)
+    ]
+    return [rows[int(i)] for i in idxs]
+
+
+def _set_equal_2d_limits(ax, xs: Sequence[float], ys: Sequence[float]) -> None:
+    if not xs or not ys:
+        return
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    xmid = 0.5 * (xmin + xmax)
+    ymid = 0.5 * (ymin + ymax)
+    radius = max(0.05, 0.55 * max(xmax - xmin, ymax - ymin))
+    ax.set_xlim(xmid - radius, xmid + radius)
+    ax.set_ylim(ymid - radius, ymid + radius)
+
+
+def _set_equal_3d_limits(
+    ax,
+    xs: Sequence[float],
+    ys: Sequence[float],
+    zs: Sequence[float],
+) -> None:
+    if not xs or not ys or not zs:
+        return
+    xmin, xmax = min(xs), max(xs)
+    ymin, ymax = min(ys), max(ys)
+    zmin, zmax = min(zs), max(zs)
+    xmid = 0.5 * (xmin + xmax)
+    ymid = 0.5 * (ymin + ymax)
+    zmid = 0.5 * (zmin + zmax)
+    radius = max(0.05, 0.55 * max(xmax - xmin, ymax - ymin, zmax - zmin))
+    ax.set_xlim(xmid - radius, xmid + radius)
+    ax.set_ylim(ymid - radius, ymid + radius)
+    ax.set_zlim(zmid - radius, zmid + radius)
+    try:
+        ax.set_box_aspect((1.0, 1.0, 1.0))
+    except Exception:
+        pass
+
+
+def _transform_points_by_base_poses(
+    points: Sequence[tuple[float, float, float]],
+    base_poses: Sequence[Sequence[float]] | None,
+) -> list[tuple[float, float, float]]:
+    if base_poses is None or len(base_poses) != len(points):
+        return [(float(x), float(y), float(z)) for x, y, z in points]
+
+    out: list[tuple[float, float, float]] = []
+    for point, pose in zip(points, base_poses):
+        if len(pose) < 3:
+            out.append((float(point[0]), float(point[1]), float(point[2])))
+            continue
+        x, y, z = [float(v) for v in point]
+        bx, by, byaw = [float(v) for v in pose[:3]]
+        c = math.cos(byaw)
+        s = math.sin(byaw)
+        out.append((bx + c * x - s * y, by + s * x + c * y, z))
+    return out
+
+
+def save_joint_path_plot_matplotlib(
+    path: Sequence[Sequence[float]],
+    joint_names: Sequence[str],
+    *,
+    out_png: str | None = None,
+    prefix: str = "joint_path",
+    x_step: float = 0.05,
+    y_scale: float = 1.0,
+    z_separation: float = 0.25,
+    line_width: float = 1.75,
+    title: str = "Joint Path Plot",
+) -> str:
+    out_path = resolve_plot_output_path(out_png, prefix=prefix)
+    show_joint_path_plot_matplotlib(
         path,
         joint_names,
-        robot_yml=robot_yml,
-        base_link=base_frame,
-        ee_link=ee_frame,
-        cpu=cpu,
+        x_step=x_step,
+        y_scale=y_scale,
+        z_separation=z_separation,
+        line_width=line_width,
+        title=title,
+        block=False,
+        out_png=out_path,
+        show=False,
     )
+    return out_path
+
+
+def save_ee_path_plot_matplotlib(
+    path: Sequence[Sequence[float]],
+    joint_names: Sequence[str],
+    *,
+    ee_frames: Sequence[tuple[str, str]],
+    robot_yml: str = ROBOT_YAML,
+    base_frame: str = BASE_FRAME,
+    world_yml: str | None = None,
+    out_png: str | None = None,
+    prefix: str = "path_ee",
+    title: str = "End-Effector Path",
+    cpu: bool = False,
+    max_path_points: int = 2000,
+    base_poses: Sequence[Sequence[float]] | None = None,
+) -> str:
+    if not path:
+        raise ValueError("path is empty")
+    if not joint_names:
+        raise ValueError("joint_names is empty")
+    if not ee_frames:
+        raise ValueError("ee_frames is empty")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_path = resolve_plot_output_path(out_png, prefix=prefix)
+    plot_path = _subsample_path(path, int(max_path_points))
+    plot_base_poses = _subsample_path(base_poses, int(max_path_points)) if base_poses is not None else None
+    world_model = _load_world_model(world_yml)
+    ee_paths = []
+    for label, ee_frame in ee_frames:
+        fk_points = _compute_fk_points(
+            plot_path,
+            joint_names,
+            robot_yml=robot_yml,
+            base_frame=base_frame,
+            ee_frame=ee_frame,
+            cpu=cpu,
+        )
+        fk_points = _transform_points_by_base_poses(fk_points, plot_base_poses)
+        ee_paths.append((str(label), str(ee_frame), fk_points))
+
+    plane_specs = [("XY", (0, 1)), ("XZ", (0, 2)), ("YZ", (1, 2))]
+    axis_labels = ["x", "y", "z"]
+    n_cols = len(ee_paths)
+    fig = plt.figure(figsize=(7 * n_cols, 18))
+    axes_2d = [[None for _ in range(n_cols)] for _ in range(3)]
+    cuboid_corners = _world_cuboid_corners(world_model)
+
+    for col, (label, ee_frame, points) in enumerate(ee_paths):
+        ax3d = fig.add_subplot(4, n_cols, col + 1, projection="3d")
+        _draw_world_cuboids_3d(ax3d, world_model)
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        zs = [p[2] for p in points]
+        ax3d.plot(xs, ys, zs, linewidth=2.4, color="#7B2CBF", label="ARM PATH")
+        ax3d.scatter([xs[0]], [ys[0]], [zs[0]], s=85, marker="*", color="C2", label="ARM START")
+        ax3d.scatter([xs[-1]], [ys[-1]], [zs[-1]], s=85, marker="X", color="C3", label="ARM GOAL")
+        if plot_base_poses is not None:
+            bx = [float(p[0]) for p in plot_base_poses if len(p) >= 2]
+            by = [float(p[1]) for p in plot_base_poses if len(p) >= 2]
+            bz = [0.0 for _ in bx]
+            byaw = [float(p[2]) for p in plot_base_poses if len(p) >= 3]
+            if bx and by:
+                ax3d.plot(bx, by, bz, linewidth=2.2, color="C0", linestyle="--", label="BASE PATH")
+                ax3d.scatter([bx[0]], [by[0]], [0.0], s=70, marker="o", color="C0", label="BASE START")
+                ax3d.scatter([bx[-1]], [by[-1]], [0.0], s=70, marker="s", color="C0", label="BASE GOAL")
+                if byaw:
+                    stride = max(1, len(bx) // 12)
+                    arrow_len = max(0.03, 0.08 * max(max(bx) - min(bx), max(by) - min(by), 0.5))
+                    ax3d.quiver(
+                        bx[::stride],
+                        by[::stride],
+                        [0.0 for _ in bx[::stride]],
+                        [math.cos(v) * arrow_len for v in byaw[::stride]],
+                        [math.sin(v) * arrow_len for v in byaw[::stride]],
+                        [0.0 for _ in byaw[::stride]],
+                        color="C0",
+                        linewidth=0.8,
+                        arrow_length_ratio=0.35,
+                    )
+
+        limit_xs = list(xs)
+        limit_ys = list(ys)
+        limit_zs = list(zs)
+        for corners in cuboid_corners:
+            limit_xs.extend(p[0] for p in corners)
+            limit_ys.extend(p[1] for p in corners)
+            limit_zs.extend(p[2] for p in corners)
+        if plot_base_poses is not None:
+            limit_xs.extend(float(p[0]) for p in plot_base_poses if len(p) >= 2)
+            limit_ys.extend(float(p[1]) for p in plot_base_poses if len(p) >= 2)
+            limit_zs.extend(0.0 for p in plot_base_poses if len(p) >= 2)
+        _set_equal_3d_limits(ax3d, limit_xs, limit_ys, limit_zs)
+        ax3d.set_title(f"{label}: {ee_frame} (3D)")
+        ax3d.set_xlabel("x")
+        ax3d.set_ylabel("y")
+        ax3d.set_zlabel("z")
+        ax3d.view_init(elev=24, azim=-58)
+        ax3d.legend(loc="upper right")
+
+    for row in range(3):
+        for col in range(n_cols):
+            axes_2d[row][col] = fig.add_subplot(4, n_cols, (row + 1) * n_cols + col + 1)
+
+    for col, (label, ee_frame, points) in enumerate(ee_paths):
+        xs_all = [p[0] for p in points]
+        ys_all = [p[1] for p in points]
+        zs_all = [p[2] for p in points]
+        coords = [xs_all, ys_all, zs_all]
+        for row, (plane_name, (i0, i1)) in enumerate(plane_specs):
+            ax = axes_2d[row][col]
+            _draw_world_cuboids_2d(ax, world_model, (i0, i1))
+            ax.plot(coords[i0], coords[i1], linewidth=2.2, color="#7B2CBF", label="PATH")
+            ax.scatter([coords[i0][0]], [coords[i1][0]], s=85, marker="*", color="C2", label="START")
+            ax.scatter([coords[i0][-1]], [coords[i1][-1]], s=85, marker="X", color="C3", label="GOAL")
+            if plot_base_poses is not None and plane_name == "XY":
+                bx = [float(p[0]) for p in plot_base_poses if len(p) >= 2]
+                by = [float(p[1]) for p in plot_base_poses if len(p) >= 2]
+                byaw = [float(p[2]) for p in plot_base_poses if len(p) >= 3]
+                if bx and by:
+                    ax.plot(bx, by, linewidth=2.0, color="C0", linestyle="--", label="BASE")
+                    ax.scatter([bx[0]], [by[0]], s=70, marker="o", color="C0", label="BASE START")
+                    ax.scatter([bx[-1]], [by[-1]], s=70, marker="s", color="C0", label="BASE GOAL")
+                    if byaw:
+                        stride = max(1, len(bx) // 12)
+                        arrow_len = max(0.03, 0.08 * max(max(bx) - min(bx), max(by) - min(by), 0.5))
+                        ax.quiver(
+                            bx[::stride],
+                            by[::stride],
+                            [math.cos(v) * arrow_len for v in byaw[::stride]],
+                            [math.sin(v) * arrow_len for v in byaw[::stride]],
+                            angles="xy",
+                            scale_units="xy",
+                            scale=1.0,
+                            color="C0",
+                            width=0.004,
+                        )
+            ax.set_title(f"{label}: {ee_frame} ({plane_name})")
+            ax.set_xlabel(axis_labels[i0])
+            ax.set_ylabel(axis_labels[i1])
+            ax.grid(True, alpha=0.3)
+            limit_xs = list(coords[i0])
+            limit_ys = list(coords[i1])
+            for corners in cuboid_corners:
+                limit_xs.extend(p[i0] for p in corners)
+                limit_ys.extend(p[i1] for p in corners)
+            if plot_base_poses is not None and plane_name == "XY":
+                limit_xs.extend([float(p[0]) for p in plot_base_poses if len(p) >= 2])
+                limit_ys.extend([float(p[1]) for p in plot_base_poses if len(p) >= 2])
+            _set_equal_2d_limits(ax, limit_xs, limit_ys)
+            if row == 0 and col == 0:
+                ax.legend(loc="best")
+
+    fig.suptitle(str(title), y=0.995)
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
+    fig.savefig(out_path, dpi=200)
+    plt.close(fig)
+    return out_path
+
+
+def save_ee_path_plot_3d_matplotlib(
+    path: Sequence[Sequence[float]],
+    joint_names: Sequence[str],
+    *,
+    ee_frames: Sequence[tuple[str, str]],
+    robot_yml: str = ROBOT_YAML,
+    base_frame: str = BASE_FRAME,
+    world_yml: str | None = None,
+    out_png: str | None = None,
+    prefix: str = "path_ee_3d",
+    title: str = "End-Effector Path 3D",
+    cpu: bool = False,
+    max_path_points: int = 2000,
+    base_poses: Sequence[Sequence[float]] | None = None,
+) -> str:
+    if not path:
+        raise ValueError("path is empty")
+    if not joint_names:
+        raise ValueError("joint_names is empty")
+    if not ee_frames:
+        raise ValueError("ee_frames is empty")
+
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    out_path = resolve_plot_output_path(out_png, prefix=prefix, file_suffix="3d")
+    plot_path = _subsample_path(path, int(max_path_points))
+    plot_base_poses = _subsample_path(base_poses, int(max_path_points)) if base_poses is not None else None
+    world_model = _load_world_model(world_yml)
+    cuboid_corners = _world_cuboid_corners(world_model)
+    ee_paths = []
+    for label, ee_frame in ee_frames:
+        fk_points = _compute_fk_points(
+            plot_path,
+            joint_names,
+            robot_yml=robot_yml,
+            base_frame=base_frame,
+            ee_frame=ee_frame,
+            cpu=cpu,
+        )
+        fk_points = _transform_points_by_base_poses(fk_points, plot_base_poses)
+        ee_paths.append((str(label), str(ee_frame), fk_points))
+
+    view_specs = [
+        ("ISO", 24, -58),
+        ("OPPOSITE", 24, 122),
+        ("SIDE", 18, -8),
+        ("TOP", 76, -90),
+    ]
+    n_cols = len(ee_paths)
+    grid_cols = max(1, 2 * n_cols)
+    fig = plt.figure(figsize=(8.5 * grid_cols, 15))
+
+    for col, (label, ee_frame, points) in enumerate(ee_paths):
+        xs = [p[0] for p in points]
+        ys = [p[1] for p in points]
+        zs = [p[2] for p in points]
+        limit_xs = list(xs)
+        limit_ys = list(ys)
+        limit_zs = list(zs)
+        for corners in cuboid_corners:
+            limit_xs.extend(p[0] for p in corners)
+            limit_ys.extend(p[1] for p in corners)
+            limit_zs.extend(p[2] for p in corners)
+        if plot_base_poses is not None:
+            limit_xs.extend(float(p[0]) for p in plot_base_poses if len(p) >= 2)
+            limit_ys.extend(float(p[1]) for p in plot_base_poses if len(p) >= 2)
+            limit_zs.extend(0.0 for p in plot_base_poses if len(p) >= 2)
+
+        for view_idx, (view_name, elev, azim) in enumerate(view_specs):
+            view_row = view_idx // 2
+            view_col = view_idx % 2
+            subplot_idx = view_row * grid_cols + col * 2 + view_col + 1
+            ax = fig.add_subplot(2, grid_cols, subplot_idx, projection="3d")
+            _draw_world_cuboids_3d(ax, world_model)
+            ax.plot(xs, ys, zs, linewidth=3.2, color="#7B2CBF", label="ARM PATH")
+            ax.scatter([xs[0]], [ys[0]], [zs[0]], s=140, marker="*", color="C2", label="ARM START")
+            ax.scatter([xs[-1]], [ys[-1]], [zs[-1]], s=140, marker="X", color="C3", label="ARM GOAL")
+
+            if plot_base_poses is not None:
+                bx = [float(p[0]) for p in plot_base_poses if len(p) >= 2]
+                by = [float(p[1]) for p in plot_base_poses if len(p) >= 2]
+                byaw = [float(p[2]) for p in plot_base_poses if len(p) >= 3]
+                if bx and by:
+                    ax.plot(bx, by, [0.0 for _ in bx], linewidth=2.8, color="C0", linestyle="--", label="BASE PATH")
+                    ax.scatter([bx[0]], [by[0]], [0.0], s=110, marker="o", color="C0", label="BASE START")
+                    ax.scatter([bx[-1]], [by[-1]], [0.0], s=110, marker="s", color="C0", label="BASE GOAL")
+                    if byaw:
+                        stride = max(1, len(bx) // 16)
+                        arrow_len = max(0.04, 0.08 * max(max(bx) - min(bx), max(by) - min(by), 0.5))
+                        ax.quiver(
+                            bx[::stride],
+                            by[::stride],
+                            [0.0 for _ in bx[::stride]],
+                            [math.cos(v) * arrow_len for v in byaw[::stride]],
+                            [math.sin(v) * arrow_len for v in byaw[::stride]],
+                            [0.0 for _ in byaw[::stride]],
+                            color="C0",
+                            linewidth=1.1,
+                            arrow_length_ratio=0.35,
+                        )
+
+            _set_equal_3d_limits(ax, limit_xs, limit_ys, limit_zs)
+            ax.set_title(f"{label}: {ee_frame} ({view_name})", pad=14)
+            ax.set_xlabel("x")
+            ax.set_ylabel("y")
+            ax.set_zlabel("z")
+            ax.view_init(elev=elev, azim=azim)
+            if view_idx == 0:
+                ax.legend(loc="upper right")
+
+    fig.suptitle(str(title), y=0.98)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(out_path, dpi=220)
+    plt.close(fig)
+    return out_path
 
 
 def _append_fk_plot_markers(
@@ -368,6 +995,8 @@ def show_joint_path_plot_matplotlib(
     line_width: float = 1.75,
     title: str = "Joint Path Plot",
     block: bool = True,
+    out_png: str | None = None,
+    show: bool = True,
 ) -> None:
     """Show the joint-space path in a matplotlib 3D window."""
     if not path:
@@ -384,6 +1013,10 @@ def show_joint_path_plot_matplotlib(
         if len(q) != n:
             raise ValueError(f"path[{i}] length {len(q)} != len(joint_names) {n}")
 
+    if out_png is not None and not show:
+        import matplotlib
+
+        matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     fig = plt.figure(figsize=(12, 8))
@@ -411,4 +1044,12 @@ def show_joint_path_plot_matplotlib(
     ax.set_zlabel("Joint index * z_sep")
     ax.view_init(elev=24.0, azim=-58.0)
     fig.tight_layout()
-    plt.show(block=bool(block))
+    if out_png is not None:
+        out_path = Path(out_png).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(str(out_path), dpi=200)
+        print(f"[PLOT] saved joint path png: {out_path}")
+    if show:
+        plt.show(block=bool(block))
+    else:
+        plt.close(fig)

@@ -100,13 +100,13 @@ def _build_arm_door_parser():
         default=True,
         help="after grasping, unlock the simulated door and follow the handle arc",
     )
-    ap.add_argument("--door_open_angle_deg", type=float, default=100.0)
+    ap.add_argument("--door_open_angle_deg", type=float, default=80.0)
     ap.add_argument("--door_open_steps", type=int, default=25)
-    ap.add_argument("--door_open_dt", type=float, default=0.08)
+    ap.add_argument("--door_open_dt", type=float, default=0.1)
     ap.add_argument(
         "--door_open_ik_batch",
         type=int,
-        default=32,
+        default=8,
         help="number of IK seed trials per opening waypoint",
     )
     ap.add_argument(
@@ -129,18 +129,24 @@ def _build_arm_door_parser():
         help="reject opening IK candidates whose FK orientation error exceeds this value",
     )
     ap.add_argument(
+        "--door_open_orientation_constraint",
+        choices=("door_relative", "rigid_grasp"),
+        default="door_relative",
+        help="opening hand orientation target: door_relative rotates the closed-grasp EE orientation with the door; rigid_grasp preserves full handle-to-EE pose",
+    )
+    ap.add_argument(
         "--door_open_base_assist",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=True,
         help="sample a simple mobile-base pose schedule during door opening",
     )
-    ap.add_argument("--door_open_base_start_deg", type=float, default=60.0)
-    ap.add_argument("--door_open_base_end_x", type=float, default=0.0)
-    ap.add_argument("--door_open_base_end_y", type=float, default=-0.50)
-    ap.add_argument("--door_open_base_end_yaw_deg", type=float, default=35.0)
-    ap.add_argument("--door_open_base_x_span", type=float, default=0.0)
-    ap.add_argument("--door_open_base_y_span", type=float, default=0.18)
-    ap.add_argument("--door_open_base_yaw_span_deg", type=float, default=18.0)
+    ap.add_argument("--door_open_base_start_deg", type=float, default=0.0)
+    ap.add_argument("--door_open_base_end_x", type=float, default=-0.20)
+    ap.add_argument("--door_open_base_end_y", type=float, default=-0.10)
+    ap.add_argument("--door_open_base_end_yaw_deg", type=float, default=-10.0)
+    ap.add_argument("--door_open_base_x_span", type=float, default=0.25)
+    ap.add_argument("--door_open_base_y_span", type=float, default=0.15)
+    ap.add_argument("--door_open_base_yaw_span_deg", type=float, default=15.0)
     ap.add_argument(
         "--door_open_base_max_candidates",
         type=int,
@@ -156,7 +162,7 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--door_open_base_planner",
         choices=("beam", "astar", "graph"),
-        default="beam",
+        default="graph",
         help="base/arm opening planner: beam keeps IK in the layer search, graph runs a fast base-door S1 planner before IK, astar keeps the old IK-in-loop A*",
     )
     ap.add_argument(
@@ -185,6 +191,12 @@ def _build_arm_door_parser():
     )
     ap.add_argument("--door_open_graph_xy_step_m", type=float, default=0.04)
     ap.add_argument("--door_open_graph_yaw_step_deg", type=float, default=5.0)
+    ap.add_argument(
+        "--door_open_graph_lambda_step_deg",
+        type=float,
+        default=1.0,
+        help="door-angle discretization for Lambda(s), the feasible angle set used by the S1 graph constraint",
+    )
     ap.add_argument("--door_open_graph_max_expansions", type=int, default=25000)
     ap.add_argument("--door_open_graph_bound_margin_m", type=float, default=0.12)
     ap.add_argument("--door_open_graph_bound_margin_yaw_deg", type=float, default=15.0)
@@ -212,7 +224,7 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--door_open_base_publish_smooth_window",
         type=int,
-        default=0,
+        default=3,
         help="optional centered moving-average window over real opening base poses before cmd_vel conversion; 0 disables",
     )
     ap.add_argument(
@@ -224,15 +236,15 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--door_open_topp_spline_mode",
         choices=("cubic", "linear"),
-        default="cubic",
+        default="linear",
         help="path interpolation used before TOPP; linear avoids cubic overshoot on short arm paths",
     )
-    ap.add_argument("--door_open_topp_spline_step", type=float, default=0.02)
-    ap.add_argument("--door_open_topp_arm_max_velocity", type=float, default=0.35)
-    ap.add_argument("--door_open_topp_arm_max_acceleration", type=float, default=0.60)
-    ap.add_argument("--door_open_topp_base_max_linear_accel", type=float, default=0.15)
-    ap.add_argument("--door_open_topp_base_max_angular_accel", type=float, default=0.30)
-    ap.add_argument("--door_open_topp_safety_scale", type=float, default=1.10)
+    ap.add_argument("--door_open_topp_spline_step", type=float, default=0.05)
+    ap.add_argument("--door_open_topp_arm_max_velocity", type=float, default=1.0)
+    ap.add_argument("--door_open_topp_arm_max_acceleration", type=float, default=2.0)
+    ap.add_argument("--door_open_topp_base_max_linear_accel", type=float, default=2.0)
+    ap.add_argument("--door_open_topp_base_max_angular_accel", type=float, default=2.0)
+    ap.add_argument("--door_open_topp_safety_scale", type=float, default=1.05)
     ap.add_argument("--door_open_topp_max_iterations", type=int, default=30)
     ap.add_argument(
         "--door_open_topp_max_duration_s",
@@ -251,7 +263,7 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--real_base_cmd_rate_hz",
         type=float,
-        default=30.0,
+        default=100.0,
         help="rate used to stream repeated /cmd_vel samples for real base opening motion",
     )
     ap.add_argument("--real_base_stop_duration_s", type=float, default=0.5)
@@ -267,7 +279,7 @@ def _build_arm_door_parser():
         "--validate_opening_fk",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="run FK on the generated opening path and report rigid grasp constraint error",
+        help="run FK on the generated opening path and report door-relative/rigid grasp constraint error",
     )
     ap.add_argument(
         "--opening_fk_log",
@@ -280,7 +292,7 @@ def _build_arm_door_parser():
         "--opening_fk_fail_on_warn",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="fail before publishing if opening FK rigid-grasp error exceeds warning thresholds",
+        help="fail before publishing if opening FK constraint error exceeds warning thresholds",
     )
     ap.add_argument(
         "--validate_opening_dynamic_collision",
@@ -1258,6 +1270,12 @@ def _build_door_opening_cspace_path(
     ik_noise = max(0.0, float(args.door_open_ik_seed_noise_std))
     max_pos_err = float(args.door_open_ik_max_pos_m)
     max_rot_err = math.radians(float(args.door_open_ik_max_rot_deg))
+    orientation_constraint = str(
+        getattr(args, "door_open_orientation_constraint", "door_relative")
+    ).strip().lower()
+    if orientation_constraint not in ("door_relative", "rigid_grasp"):
+        raise RuntimeError(f"unknown door_open_orientation_constraint={orientation_constraint!r}")
+    print(f"[ARM_DOOR][OPEN][ORI] constraint={orientation_constraint}")
 
     collision_checker = None
     collision_source_world: dict[str, Any] | None = None
@@ -1320,6 +1338,7 @@ def _build_door_opening_cspace_path(
         graph_cfg = BaseDoorGraphConfig(
             steps=steps,
             goal_alpha_rad=goal_alpha,
+            lambda_step_rad=max(1.0e-4, math.radians(float(args.door_open_graph_lambda_step_deg))),
             base_motion_start_alpha_rad=math.radians(float(args.door_open_base_start_deg)),
             closed_handle_xyz=tuple(float(v) for v in closed_handle_xyz),
             door_hinge_xyz=tuple(float(v) for v in DOOR_HINGE_XYZ),
@@ -1368,10 +1387,12 @@ def _build_door_opening_cspace_path(
         planned_alphas = [float(v) for v in graph_plan.door_alphas_rad]
         print(
             "[ARM_DOOR][OPEN][S1-GRAPH] done "
+            "constraint=2010-ICRA-Lambda-overlap "
             f"waypoints={len(planned_alphas)} cost={graph_plan.cost:.3f} "
             f"expanded={graph_plan.expansions} generated={graph_plan.generated} "
             f"rejected_collision={graph_plan.rejected_collision} "
             f"rejected_reach={graph_plan.rejected_reach} "
+            f"rejected_lambda_overlap={graph_plan.rejected_lambda_overlap} "
             f"front_goal={['%.3f' % v for v in graph_cfg.front_goal_xyyaw]}"
         )
     else:
@@ -1395,6 +1416,8 @@ def _build_door_opening_cspace_path(
             inv_ee_handle_xyz,
             inv_ee_handle_quat,
         )
+        if orientation_constraint == "door_relative":
+            ee_quat_wxyz = _quat_mul_wxyz(_yaw_quat_wxyz(alpha), grasp_ee_quat_wxyz)
         collision_cuboid_samples: list[Mapping[str, Any]] = []
         if collision_checker is not None and collision_source_world is not None:
             for collision_alpha in _opening_collision_alpha_samples(args, float(alpha)):
@@ -2001,7 +2024,7 @@ def _validate_opening_fk(
         )
         if bool(args.opening_fk_fail_on_warn):
             raise RuntimeError(
-                "opening FK rigid-grasp validation failed: "
+                "opening FK constraint validation failed: "
                 f"max_pos_err={max_pos_err:.4f}m "
                 f"max_rot_err={math.degrees(max_rot_err):.2f}deg"
             )
@@ -2515,13 +2538,15 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
     from capstone_pkg.planner.arm_rrt_common.path_publisher import publish_joint_path
     from capstone_pkg.planner.arm_rrt_common.plot import (
         publish_joint_path_plot,
-        show_joint_path_plot_matplotlib,
+        save_ee_path_plot_3d_matplotlib,
+        save_ee_path_plot_matplotlib,
     )
     from capstone_pkg.planner.arm_rrt_common.single_arm_runner import (
         _publish_world_collision_for_mujoco,
         _resolve_world_yml,
         build_single_arm_tbrrt_config,
     )
+    from capstone_pkg.utils.config import LEFT_EE_FRAME, RIGHT_EE_FRAME
 
     args = _build_arm_door_parser().parse_args(list(argv) if argv is not None else None)
     arm = normalize_arm_name(args.arm)
@@ -2613,6 +2638,10 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
         print(f"[ARM_DOOR] saved plan -> {args.save}")
 
     active_joint_names, active_path = build_active_joint_path(plan)
+    plot_cspace_names = plan.cspace_joint_names
+    plot_cspace_path = plan.spline_path
+    plot_base_poses = None
+    plot_stage = "reach"
 
     if args.publish_path:
         if args.publish_mode == "real":
@@ -2706,6 +2735,10 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
                         open_active_names,
                         open_cspace_path,
                     )
+                    plot_cspace_names = open_cspace_names
+                    plot_cspace_path = open_cspace_path
+                    plot_base_poses = open_base_poses if open_base_poses else None
+                    plot_stage = "opening"
                     if bool(args.door_open_base_assist) and open_base_poses:
                         print(
                             "[ARM_DOOR][OPEN][BASE] "
@@ -2746,17 +2779,39 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
         )
 
     if args.plot:
+        ee_frame = LEFT_EE_FRAME if arm == "left" else RIGHT_EE_FRAME
         try:
-            show_joint_path_plot_matplotlib(
-                active_path,
-                active_joint_names,
-                x_step=float(args.plot_x_step),
-                y_scale=float(args.plot_y_scale),
-                z_separation=float(args.plot_z_sep),
-                title="ARM_DOOR Joint Path",
+            out_png = save_ee_path_plot_matplotlib(
+                plot_cspace_path,
+                plot_cspace_names,
+                ee_frames=[(f"{arm} EE", ee_frame)],
+                robot_yml=str(args.robot_yml),
+                world_yml=resolved_world_yml,
+                out_png=str(args.plot_output),
+                prefix=f"arm_door_{arm}_{plot_stage}_path_ee",
+                title=f"ARM_DOOR {arm} {plot_stage} End-Effector/Base Path",
+                cpu=bool(args.cpu),
+                base_poses=plot_base_poses,
             )
+            print(f"[ARM_DOOR][PLOT] saved: {out_png}")
+            try:
+                out_png_3d = save_ee_path_plot_3d_matplotlib(
+                    plot_cspace_path,
+                    plot_cspace_names,
+                    ee_frames=[(f"{arm} EE", ee_frame)],
+                    robot_yml=str(args.robot_yml),
+                    world_yml=resolved_world_yml,
+                    out_png=str(args.plot_output),
+                    prefix=f"arm_door_{arm}_{plot_stage}_path_ee_3d",
+                    title=f"ARM_DOOR {arm} {plot_stage} End-Effector/Base Path 3D",
+                    cpu=bool(args.cpu),
+                    base_poses=plot_base_poses,
+                )
+                print(f"[ARM_DOOR][PLOT] saved 3D: {out_png_3d}")
+            except Exception as exc:
+                print(f"[ARM_DOOR][PLOT] 3D-only plot failed: {exc}")
         except Exception as exc:
-            print(f"[ARM_DOOR][PLOT] matplotlib plot failed: {exc}")
+            print(f"[ARM_DOOR][PLOT] task-space EE plot failed: {exc}")
             return 1
 
     return 0

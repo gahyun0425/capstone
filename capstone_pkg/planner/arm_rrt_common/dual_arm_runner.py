@@ -18,12 +18,16 @@ from capstone_pkg.planner.arm_rrt_common.path_publisher import (
 )
 from capstone_pkg.planner.arm_rrt_common.plot import (
     publish_joint_path_plot,
-    show_joint_path_plot_matplotlib,
+    save_ee_path_plot_3d_matplotlib,
+    save_ee_path_plot_matplotlib,
+    save_joint_path_plot_matplotlib,
 )
 from capstone_pkg.planner.arm_rrt_common.spline import spline_interpolate_path
 from capstone_pkg.utils.config import (
     CSPACE_JOINT_NAMES_14,
+    LEFT_EE_FRAME,
     LEFT_JOINTS,
+    RIGHT_EE_FRAME,
     RIGHT_JOINTS,
     ROBOT_URDF,
     ROBOT_YAML,
@@ -259,7 +263,12 @@ def build_dual_arm_parser() -> argparse.ArgumentParser:
         "--plot",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="show planned path in a matplotlib window",
+        help="save planned end-effector path as a PNG",
+    )
+    ap.add_argument(
+        "--plot_output",
+        default="",
+        help="PNG file or directory used by --plot; empty creates an auto-named file in cwd",
     )
     ap.add_argument(
         "--plot_topic",
@@ -934,19 +943,52 @@ def main_dual_arm(argv: Sequence[str] | None = None) -> int:
         print("[PLOT] done.")
 
     if args.plot:
-        print("[PLOT] Showing matplotlib joint path window...")
+        print("[PLOT] Saving end-effector path PNG...")
         try:
-            show_joint_path_plot_matplotlib(
+            out_png = save_ee_path_plot_matplotlib(
                 q_path,
                 list(CSPACE_JOINT_NAMES_14),
-                x_step=float(args.plot_x_step),
-                y_scale=float(args.plot_y_scale),
-                z_separation=float(args.plot_z_sep),
-                title="Dual Arm Joint Path",
+                ee_frames=[("Left EE", LEFT_EE_FRAME), ("Right EE", RIGHT_EE_FRAME)],
+                robot_yml=str(args.robot_yml),
+                world_yml=world_yml,
+                out_png=str(args.plot_output),
+                prefix="dual_arm_path_ee",
+                title="Dual Arm End-Effector Path",
+                cpu=bool(args.cpu),
             )
+            print(f"[PLOT] saved: {out_png}")
+            try:
+                out_png_3d = save_ee_path_plot_3d_matplotlib(
+                    q_path,
+                    list(CSPACE_JOINT_NAMES_14),
+                    ee_frames=[("Left EE", LEFT_EE_FRAME), ("Right EE", RIGHT_EE_FRAME)],
+                    robot_yml=str(args.robot_yml),
+                    world_yml=world_yml,
+                    out_png=str(args.plot_output),
+                    prefix="dual_arm_path_ee_3d",
+                    title="Dual Arm End-Effector Path 3D",
+                    cpu=bool(args.cpu),
+                )
+                print(f"[PLOT] saved 3D: {out_png_3d}")
+            except Exception as exc:
+                print(f"[PLOT] 3D-only EE path plot failed: {exc}")
         except Exception as exc:
-            print(f"[PLOT] matplotlib plot failed: {exc}")
-            return 1
+            print(f"[PLOT] EE path plot failed: {exc}")
+            try:
+                out_png = save_joint_path_plot_matplotlib(
+                    q_path,
+                    list(CSPACE_JOINT_NAMES_14),
+                    out_png=str(args.plot_output),
+                    prefix="dual_arm_joint_path",
+                    title="Dual Arm Joint Path",
+                    x_step=float(args.plot_x_step),
+                    y_scale=float(args.plot_y_scale),
+                    z_separation=float(args.plot_z_sep),
+                )
+                print(f"[PLOT] saved fallback joint plot: {out_png}")
+            except Exception as fallback_exc:
+                print(f"[PLOT] matplotlib plot failed: {fallback_exc}")
+                return 1
 
     return 0
 
