@@ -62,6 +62,7 @@ _COLLISION_MODELS = {
     "shelf_1": SHELF_YAML,
     "shelf_2": LONG_SHELF_YAML,
 }
+_ARM_PICKING_FINISH_DELAY_S = 2.0
 
 _FIXED_ALIGN_QUATERNION_XYZW = (
     0.5,
@@ -83,8 +84,8 @@ _SHELF_1_ALIGN_QUATERNION_XYZW = (
 )
 _SHELF_1_ALIGN_FIXED_X_M = 0.5
 _SHELF_1_ALIGN_FIXED_Z_M = 1.2
-_GRASP_OBJECT_POSE_X_OFFSET_M = 0.01
-_GRASP_COLLISION_OBJECT_SIZE_X_M = 0.0
+_GRASP_OBJECT_POSE_X_OFFSET_M = 0.0
+_GRASP_COLLISION_OBJECT_SIZE_X_M = 0.015
 _GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.01
 _SHELF_1_GRASP_COLLISION_OBJECT_SIZE_Z_OFFSET_M = 0.0
 _MIN_GRASP_COLLISION_OBJECT_SIZE_M = 0.001
@@ -2090,9 +2091,11 @@ class ArmPickingCoordinator(Node):
 
     def _publish_arm_picking_finish_after_motion_complete(self, arm: str, *, stage: str) -> None:
         self.get_logger().info(
-            "[ARM_PICKING] motion completed; publishing arm_picking_finish: "
+            "[ARM_PICKING] motion completed; waiting before publishing arm_picking_finish: "
             f"arm={normalize_arm_name(arm)} stage={stage}"
+            f" delay_s={_ARM_PICKING_FINISH_DELAY_S:.1f}"
         )
+        time.sleep(_ARM_PICKING_FINISH_DELAY_S)
         self._publish_arm_picking_finish(arm, stage=stage)
 
     def _execute_grasp_sequence(
