@@ -62,7 +62,8 @@ _COLLISION_MODELS = {
     "shelf_1": SHELF_YAML,
     "shelf_2": LONG_SHELF_YAML,
 }
-_ARM_PICKING_FINISH_DELAY_S = 2.0
+_ARM_PICKING_FINISH_DELAY_S = 5.0
+_GRIPPER_START_DELAY_AFTER_ARRIVAL_S = 3.0
 
 _FIXED_ALIGN_QUATERNION_XYZW = (
     0.5,
@@ -84,9 +85,9 @@ _SHELF_1_ALIGN_QUATERNION_XYZW = (
 )
 _SHELF_1_ALIGN_FIXED_X_M = 0.5
 _SHELF_1_ALIGN_FIXED_Z_M = 1.2
-_GRASP_OBJECT_POSE_X_OFFSET_M = 0.0
-_GRASP_COLLISION_OBJECT_SIZE_X_M = 0.015
-_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.01
+_GRASP_OBJECT_POSE_X_OFFSET_M = 0.01
+_GRASP_COLLISION_OBJECT_SIZE_X_M = 0.01
+_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.015
 _SHELF_1_GRASP_COLLISION_OBJECT_SIZE_Z_OFFSET_M = 0.0
 _MIN_GRASP_COLLISION_OBJECT_SIZE_M = 0.001
 _SHELF_1_POST_GRASP_RAISE_Z_M = 0.30
@@ -99,7 +100,7 @@ _PREFERRED_GRASP_QUATERNION_XYZW = (
 )
 _GRASP_IK_CANDIDATE_BATCH_SIZE = 3
 _GRASP_FALLBACK_Z_OFFSET_M = 0.03
-_GRASP_FALLBACK_X_OFFSET_M = -0.015
+_GRASP_FALLBACK_X_OFFSET_M = -0.0
 _ZERO_JOINT_TOL = 1.0e-4
 
 
@@ -2076,6 +2077,11 @@ class ArmPickingCoordinator(Node):
 
     def _publish_gripper_start(self, arm: str) -> None:
         normalized_arm = normalize_arm_name(arm)
+        self.get_logger().info(
+            "[ARM_PICKING] arm arrived; waiting before publishing gripper_start: "
+            f"arm={normalized_arm} delay_s={_GRIPPER_START_DELAY_AFTER_ARRIVAL_S:.1f}"
+        )
+        time.sleep(_GRIPPER_START_DELAY_AFTER_ARRIVAL_S)
         msg = String()
         msg.data = normalized_arm
         self._gripper_start_pub.publish(msg)
