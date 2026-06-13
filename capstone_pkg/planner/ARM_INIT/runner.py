@@ -85,7 +85,7 @@ def _duration_from_seconds(seconds: float) -> Duration:
 def _real_traj_qos(args: argparse.Namespace) -> QoSProfile:
     reliability = (
         ReliabilityPolicy.RELIABLE
-        if str(getattr(args, "publish_reliability", "best_effort")).strip().lower()
+        if str(getattr(args, "publish_reliability", "reliable")).strip().lower()
         == "reliable"
         else ReliabilityPolicy.BEST_EFFORT
     )
@@ -100,7 +100,7 @@ def _real_traj_qos(args: argparse.Namespace) -> QoSProfile:
         reliability=reliability,
         durability=durability,
         history=HistoryPolicy.KEEP_LAST,
-        depth=max(1, int(getattr(args, "publish_qos_depth", 1))),
+        depth=max(1, int(getattr(args, "publish_qos_depth", 10))),
     )
 
 
@@ -1005,7 +1005,7 @@ class ArmInitNode(Node):
         wait_ack_s = float(getattr(self._args, "publish_wait_ack_s", 0.0))
         wait_for_ack = (
             wait_ack_s > 0.0
-            and str(getattr(self._args, "publish_reliability", "best_effort"))
+            and str(getattr(self._args, "publish_reliability", "reliable"))
             .strip()
             .lower()
             == "reliable"

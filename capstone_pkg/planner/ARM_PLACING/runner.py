@@ -506,7 +506,7 @@ class ArmPlacingNode(Node):
         )
         reliability = (
             ReliabilityPolicy.RELIABLE
-            if str(getattr(args, "publish_reliability", "best_effort")).strip().lower()
+            if str(getattr(args, "publish_reliability", "reliable")).strip().lower()
             == "reliable"
             else ReliabilityPolicy.BEST_EFFORT
         )
@@ -520,7 +520,7 @@ class ArmPlacingNode(Node):
         traj_qos = _command_qos(
             reliability=reliability,
             durability=durability,
-            depth=int(getattr(args, "publish_qos_depth", 1)),
+            depth=int(getattr(args, "publish_qos_depth", 10)),
         )
         self._traj_publishers: dict[str, object] = {
             str(args.real_left_topic): self.create_publisher(

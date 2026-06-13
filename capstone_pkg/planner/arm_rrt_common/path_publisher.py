@@ -6,7 +6,7 @@ import time
 from typing import Sequence
 
 import rclpy
-from builtin_interfaces.msg import Duration
+from builtin_interfaces.msg import Duration, Time
 from control_msgs.action import FollowJointTrajectory
 from rclpy.action import ActionClient
 from rclpy.duration import Duration as RclpyDuration
@@ -158,6 +158,12 @@ def _future_stamp(node: Node, *, delay_s: float):
     if delay_s <= 0.0:
         return node.get_clock().now().to_msg()
     return (node.get_clock().now() + RclpyDuration(seconds=float(delay_s))).to_msg()
+
+
+def _command_stamp(node: Node, *, delay_s: float, zero_stamp: bool):
+    if zero_stamp:
+        return Time(sec=0, nanosec=0)
+    return _future_stamp(node, delay_s=delay_s)
 
 
 def _validate_commands(
@@ -389,6 +395,7 @@ def publish_joint_trajectory(
     durability: str = "volatile",
     qos_depth: int = 10,
     start_time_delay_s: float = 0.0,
+    zero_header_stamp: bool = False,
 ) -> None:
     """Publish joint-space waypoints as a JointTrajectory command."""
     _validate_joint_path(path, joint_names, dt)
@@ -437,7 +444,11 @@ def publish_joint_trajectory(
                 )
                 next_log_t = now + 1.0
 
-            msg.header.stamp = _future_stamp(node, delay_s=float(start_time_delay_s))
+            msg.header.stamp = _command_stamp(
+                node,
+                delay_s=float(start_time_delay_s),
+                zero_stamp=bool(zero_header_stamp),
+            )
             pub.publish(msg)
             rclpy.spin_once(node, timeout_sec=0.0)
             time.sleep(max(0.05, float(publish_period_s)))
@@ -461,7 +472,11 @@ def publish_joint_trajectory(
         and _reliability_policy_from_name(reliability) == QoSReliabilityPolicy.RELIABLE
     )
     for i in range(repeats):
-        msg.header.stamp = _future_stamp(node, delay_s=float(start_time_delay_s))
+        msg.header.stamp = _command_stamp(
+            node,
+            delay_s=float(start_time_delay_s),
+            zero_stamp=bool(zero_header_stamp),
+        )
         pub.publish(msg)
         rclpy.spin_once(node, timeout_sec=0.0)
         if wait_for_ack and not pub.wait_for_all_acked(ack_timeout):
@@ -495,6 +510,7 @@ def publish_joint_trajectory_group(
     durability: str = "volatile",
     qos_depth: int = 10,
     start_time_delay_s: float = 0.0,
+    zero_header_stamp: bool = False,
 ) -> None:
     """Publish multiple JointTrajectory commands with a shared start timestamp."""
     normalized = _validate_commands(commands, dt=dt)
@@ -573,7 +589,11 @@ def publish_joint_trajectory_group(
                     )
                     next_log_t = now + 1.0
 
-                stamp = _future_stamp(node, delay_s=float(start_time_delay_s))
+                stamp = _command_stamp(
+                    node,
+                    delay_s=float(start_time_delay_s),
+                    zero_stamp=bool(zero_header_stamp),
+                )
                 for idx in unresolved:
                     messages[idx].header.stamp = stamp
                     publishers[idx].publish(messages[idx])
@@ -605,7 +625,11 @@ def publish_joint_trajectory_group(
             and _reliability_policy_from_name(reliability) == QoSReliabilityPolicy.RELIABLE
         )
         for i in range(repeats):
-            stamp = _future_stamp(node, delay_s=float(start_time_delay_s))
+            stamp = _command_stamp(
+                node,
+                delay_s=float(start_time_delay_s),
+                zero_stamp=bool(zero_header_stamp),
+            )
             for msg in messages:
                 msg.header.stamp = stamp
             for idx, pub in enumerate(publishers):

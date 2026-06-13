@@ -165,9 +165,9 @@ def build_tbrrt_parser() -> argparse.ArgumentParser:
     ap.add_argument("--publish_period_s", type=float, default=0.03)
     ap.add_argument("--publish_wait_ack_s", type=float, default=0.0)
     ap.add_argument("--publish_keep_alive_s", type=float, default=1.0)
-    ap.add_argument("--publish_reliability", choices=("reliable", "best_effort"), default="best_effort")
+    ap.add_argument("--publish_reliability", choices=("reliable", "best_effort"), default="reliable")
     ap.add_argument("--publish_durability", choices=("volatile", "transient_local"), default="volatile")
-    ap.add_argument("--publish_qos_depth", type=int, default=1)
+    ap.add_argument("--publish_qos_depth", type=int, default=10)
     ap.add_argument("--publish_transient_local", action=argparse.BooleanOptionalAction, default=False)
     ap.add_argument("--attach_object", action="store_true", default=False)
     ap.add_argument("--publish_world_collision", action=argparse.BooleanOptionalAction, default=True, help="publish selected world collision yaml to MuJoCo simulation")
@@ -487,13 +487,13 @@ def main_tbrrt(argv: Sequence[str] | None = None) -> int:
             publish_period_s=float(args.publish_period_s),
             wait_ack_s=float(args.publish_wait_ack_s),
             keep_alive_s=float(args.publish_keep_alive_s),
-            reliability=str(getattr(args, "publish_reliability", "best_effort")),
+            reliability=str(getattr(args, "publish_reliability", "reliable")),
             durability=(
                 "transient_local"
                 if bool(getattr(args, "publish_transient_local", False))
                 else str(getattr(args, "publish_durability", "volatile"))
             ),
-            qos_depth=int(getattr(args, "publish_qos_depth", 1)),
+            qos_depth=int(getattr(args, "publish_qos_depth", 10)),
             start_time_delay_s=float(start_time_delay_s),
         )
         return "topic"

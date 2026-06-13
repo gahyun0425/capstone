@@ -280,6 +280,12 @@ def build_single_arm_parser(
         help="delay [s] before JointTrajectory execution starts on the robot",
     )
     ap.add_argument(
+        "--real_zero_trajectory_stamp",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use header.stamp=0 for real JointTrajectory commands so the robot executes immediately without relying on PC/robot clock sync",
+    )
+    ap.add_argument(
         "--publish_wait_subscriber_s",
         type=float,
         default=5.0,
@@ -304,7 +310,7 @@ def build_single_arm_parser(
     ap.add_argument(
         "--publish_reliability",
         choices=("reliable", "best_effort"),
-        default="best_effort",
+        default="reliable",
         help="QoS reliability used for real JointTrajectory publishers",
     )
     ap.add_argument(
@@ -316,7 +322,7 @@ def build_single_arm_parser(
     ap.add_argument(
         "--publish_qos_depth",
         type=int,
-        default=1,
+        default=10,
         help="QoS depth used for real JointTrajectory publishers",
     )
     ap.add_argument("--publish_transient_local", action=argparse.BooleanOptionalAction, default=False, help="deprecated compatibility flag; use --publish_durability")
@@ -579,14 +585,15 @@ def main_single_arm(
                     publish_period_s=args.publish_period_s,
                     wait_ack_s=args.publish_wait_ack_s,
                     keep_alive_s=args.publish_keep_alive_s,
-                    reliability=str(getattr(args, "publish_reliability", "best_effort")),
+                    reliability=str(getattr(args, "publish_reliability", "reliable")),
                     durability=(
                         "transient_local"
                         if bool(getattr(args, "publish_transient_local", False))
                         else str(getattr(args, "publish_durability", "volatile"))
                     ),
-                    qos_depth=int(getattr(args, "publish_qos_depth", 1)),
+                    qos_depth=int(getattr(args, "publish_qos_depth", 10)),
                     start_time_delay_s=float(getattr(args, "start_delay_s", 0.2)),
+                    zero_header_stamp=bool(getattr(args, "real_zero_trajectory_stamp", True)),
                 )
                 return "topic"
 

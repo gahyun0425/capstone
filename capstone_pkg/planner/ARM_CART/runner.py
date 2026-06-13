@@ -266,7 +266,7 @@ def build_arm_cart_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--publish_reliability",
         choices=("reliable", "best_effort"),
-        default="best_effort",
+        default="reliable",
         help="QoS reliability used for real JointTrajectory publishers",
     )
     ap.add_argument(
@@ -278,7 +278,7 @@ def build_arm_cart_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--publish_qos_depth",
         type=int,
-        default=1,
+        default=10,
         help="QoS depth used for real JointTrajectory publishers",
     )
     ap.add_argument(

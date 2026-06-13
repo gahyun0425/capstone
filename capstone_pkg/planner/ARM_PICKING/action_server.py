@@ -1469,13 +1469,13 @@ class ArmPickingCoordinator(Node):
                 publish_period_s=float(self._args.publish_period_s),
                 wait_ack_s=float(self._args.publish_wait_ack_s),
                 keep_alive_s=float(self._args.publish_keep_alive_s),
-                reliability=str(getattr(self._args, "publish_reliability", "best_effort")),
+                reliability=str(getattr(self._args, "publish_reliability", "reliable")),
                 durability=(
                     "transient_local"
                     if bool(getattr(self._args, "publish_transient_local", False))
                     else str(getattr(self._args, "publish_durability", "volatile"))
                 ),
-                qos_depth=int(getattr(self._args, "publish_qos_depth", 1)),
+                qos_depth=int(getattr(self._args, "publish_qos_depth", 10)),
                 start_time_delay_s=float(getattr(self._args, "start_delay_s", 0.2)),
             )
             return
@@ -1747,13 +1747,13 @@ class ArmPickingCoordinator(Node):
                 publish_period_s=float(self._args.publish_period_s),
                 wait_ack_s=float(self._args.publish_wait_ack_s),
                 keep_alive_s=float(self._args.publish_keep_alive_s),
-                reliability=str(getattr(self._args, "publish_reliability", "best_effort")),
+                reliability=str(getattr(self._args, "publish_reliability", "reliable")),
                 durability=(
                     "transient_local"
                     if bool(getattr(self._args, "publish_transient_local", False))
                     else str(getattr(self._args, "publish_durability", "volatile"))
                 ),
-                qos_depth=int(getattr(self._args, "publish_qos_depth", 1)),
+                qos_depth=int(getattr(self._args, "publish_qos_depth", 10)),
                 start_time_delay_s=float(getattr(self._args, "start_delay_s", 0.2)),
             )
             return

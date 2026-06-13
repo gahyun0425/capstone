@@ -208,7 +208,7 @@ def build_dual_arm_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--publish_reliability",
         choices=("reliable", "best_effort"),
-        default="best_effort",
+        default="reliable",
         help="QoS reliability used for real JointTrajectory publishers",
     )
     ap.add_argument(
@@ -220,7 +220,7 @@ def build_dual_arm_parser() -> argparse.ArgumentParser:
     ap.add_argument(
         "--publish_qos_depth",
         type=int,
-        default=1,
+        default=10,
         help="QoS depth used for real JointTrajectory publishers",
     )
     ap.add_argument(
@@ -637,13 +637,13 @@ def _publish_real_group(
                         publish_period_s=float(args.publish_period_s),
                         wait_ack_s=float(args.publish_wait_ack_s),
                         keep_alive_s=float(args.publish_keep_alive_s),
-                        reliability=str(getattr(args, "publish_reliability", "best_effort")),
+                        reliability=str(getattr(args, "publish_reliability", "reliable")),
                         durability=(
                             "transient_local"
                             if bool(getattr(args, "publish_transient_local", False))
                             else str(getattr(args, "publish_durability", "volatile"))
                         ),
-                        qos_depth=int(getattr(args, "publish_qos_depth", 1)),
+                        qos_depth=int(getattr(args, "publish_qos_depth", 10)),
                         start_time_delay_s=float(args.start_delay_s),
                     )
             else:
@@ -662,13 +662,13 @@ def _publish_real_group(
                     publish_period_s=float(args.publish_period_s),
                     wait_ack_s=float(args.publish_wait_ack_s),
                     keep_alive_s=float(args.publish_keep_alive_s),
-                    reliability=str(getattr(args, "publish_reliability", "best_effort")),
+                    reliability=str(getattr(args, "publish_reliability", "reliable")),
                     durability=(
                         "transient_local"
                         if bool(getattr(args, "publish_transient_local", False))
                         else str(getattr(args, "publish_durability", "volatile"))
                     ),
-                    qos_depth=int(getattr(args, "publish_qos_depth", 1)),
+                    qos_depth=int(getattr(args, "publish_qos_depth", 10)),
                     start_time_delay_s=float(args.start_delay_s),
                 )
         except RuntimeError as exc:

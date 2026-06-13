@@ -15,7 +15,7 @@ _PKG_ROOT = Path(__file__).resolve().parents[3]
 DOOR_MODEL_XML = str(_PKG_ROOT / "models" / "door_ffw_sg2.xml")
 DOOR_COLLISION_YAML = str(_PKG_ROOT / "models" / "door_collision.yaml")
 HANDLE_TARGET_X_OFFSET_M = -0.02
-HANDLE_TARGET_Z_OFFSET_M = 0.10
+HANDLE_TARGET_Z_OFFSET_M = 0.0
 
 DEFAULT_DOOR_UNLOCK_TOPIC = "/door_unlock"
 DOOR_HINGE_JOINT = "fridge_door_hinge_joint"
@@ -159,6 +159,18 @@ def _build_arm_door_parser():
         type=float,
         default=None,
         help="closed-door handle frame quaternion in xyzw order; default uses --target_quat_xyzw",
+    )
+    ap.add_argument(
+        "--door_open_handle_radial_offset_m",
+        type=float,
+        default=0.11,
+        help="radial correction applied to the opening EE target; positive moves away from the hinge",
+    )
+    ap.add_argument(
+        "--door_open_orientation_lag_deg",
+        type=float,
+        default=0.0,
+        help="use a smaller door angle for opening EE orientation than for handle position; useful when the physical door lags the commanded hinge",
     )
     ap.add_argument(
         "--close_gripper_after_path",
@@ -363,6 +375,15 @@ def _build_arm_door_parser():
         help="rate used to stream repeated /cmd_vel samples for real base opening motion",
     )
     ap.add_argument("--real_base_stop_duration_s", type=float, default=0.5)
+    ap.add_argument(
+        "--door_open_arm_republish_if_static",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="in real opening mode, republish the arm trajectory if joint_states do not show arm motion shortly after publishing",
+    )
+    ap.add_argument("--door_open_arm_republish_attempts", type=int, default=2)
+    ap.add_argument("--door_open_arm_motion_check_s", type=float, default=1.0)
+    ap.add_argument("--door_open_arm_motion_threshold_rad", type=float, default=0.005)
     ap.add_argument("--door_unlock_topic", default=DEFAULT_DOOR_UNLOCK_TOPIC)
     ap.add_argument(
         "--door_open_sync_hinge",
@@ -478,14 +499,15 @@ def _publish_real_path(args, arm: str, joint_names, path) -> None:
         publish_period_s=args.publish_period_s,
         wait_ack_s=args.publish_wait_ack_s,
         keep_alive_s=args.publish_keep_alive_s,
-        reliability=str(getattr(args, "publish_reliability", "best_effort")),
+        reliability=str(getattr(args, "publish_reliability", "reliable")),
         durability=(
             "transient_local"
             if bool(getattr(args, "publish_transient_local", False))
             else str(getattr(args, "publish_durability", "volatile"))
         ),
-        qos_depth=int(getattr(args, "publish_qos_depth", 1)),
+        qos_depth=int(getattr(args, "publish_qos_depth", 10)),
         start_time_delay_s=float(getattr(args, "start_delay_s", 0.2)),
+        zero_header_stamp=bool(getattr(args, "real_zero_trajectory_stamp", True)),
     )
 
 
@@ -539,14 +561,15 @@ def _publish_gripper_close(args, arm: str) -> None:
             publish_period_s=args.publish_period_s,
             wait_ack_s=args.publish_wait_ack_s,
             keep_alive_s=args.publish_keep_alive_s,
-            reliability=str(getattr(args, "publish_reliability", "best_effort")),
+            reliability=str(getattr(args, "publish_reliability", "reliable")),
             durability=(
                 "transient_local"
                 if bool(getattr(args, "publish_transient_local", False))
                 else str(getattr(args, "publish_durability", "volatile"))
             ),
-            qos_depth=int(getattr(args, "publish_qos_depth", 1)),
+            qos_depth=int(getattr(args, "publish_qos_depth", 10)),
             start_time_delay_s=float(getattr(args, "start_delay_s", 0.2)),
+            zero_header_stamp=bool(getattr(args, "real_zero_trajectory_stamp", True)),
         )
         return
 
@@ -636,6 +659,29 @@ def _door_handle_pose_at(
     xyz = [hinge[i] + rel_rot[i] for i in range(3)]
     quat = _quat_mul_wxyz(_yaw_quat_wxyz(alpha_rad), closed_quat_wxyz)
     return xyz, quat
+
+
+def _offset_point_radially_from_hinge(
+    point_xyz: Sequence[float],
+    hinge_xyz: Sequence[float],
+    offset_m: float,
+) -> list[float]:
+    point = [float(v) for v in point_xyz]
+    hinge = [float(v) for v in hinge_xyz]
+    offset = float(offset_m)
+    if abs(offset) <= 1.0e-12:
+        return point
+
+    dx = point[0] - hinge[0]
+    dy = point[1] - hinge[1]
+    norm_xy = math.hypot(dx, dy)
+    if norm_xy <= 1.0e-12:
+        raise RuntimeError("cannot apply door handle radial offset: handle and hinge overlap in XY")
+    return [
+        point[0] + offset * dx / norm_xy,
+        point[1] + offset * dy / norm_xy,
+        point[2],
+    ]
 
 
 def _world_pose_to_base_pose(
@@ -1048,6 +1094,118 @@ def _base_pose_delta_to_body_twist(
     return vx_clamped, vy_clamped, wz_clamped, clamped
 
 
+def _base_path_distance(base_poses: Sequence[Sequence[float]]) -> tuple[float, float]:
+    poses = [[float(v) for v in pose] for pose in base_poses]
+    if len(poses) < 2:
+        return 0.0, 0.0
+    xy = 0.0
+    yaw = 0.0
+    for prev, cur in zip(poses[:-1], poses[1:]):
+        xy += math.hypot(cur[0] - prev[0], cur[1] - prev[1])
+        yaw += abs(_wrap_pi(cur[2] - prev[2]))
+    return xy, yaw
+
+
+def _print_base_path_summary(label: str, base_poses: Sequence[Sequence[float]]) -> None:
+    poses = [[float(v) for v in pose] for pose in base_poses]
+    if not poses:
+        print(f"{label} base_path=empty")
+        return
+    start = poses[0]
+    end = poses[-1]
+    xy_len, yaw_len = _base_path_distance(poses)
+    print(
+        f"{label} waypoints={len(poses)} "
+        f"start={['%.3f' % v for v in start]} "
+        f"end={['%.3f' % v for v in end]} "
+        f"delta_xy={math.hypot(end[0] - start[0], end[1] - start[1]):.3f}m "
+        f"path_xy={xy_len:.3f}m "
+        f"delta_yaw={math.degrees(_wrap_pi(end[2] - start[2])):.1f}deg "
+        f"path_yaw={math.degrees(yaw_len):.1f}deg"
+    )
+
+
+def _joint_delta_abs(a: float, b: float) -> float:
+    return abs(math.atan2(math.sin(float(a) - float(b)), math.cos(float(a) - float(b))))
+
+
+def _read_joint_sample_with_node(
+    node,
+    joint_names: Sequence[str],
+    *,
+    topic: str,
+    wait_s: float,
+) -> list[float] | None:
+    import rclpy
+    from sensor_msgs.msg import JointState
+
+    names = [str(name) for name in joint_names]
+    latest_by_name: dict[str, float] = {}
+
+    def _cb(msg: JointState) -> None:
+        name_to_idx = {str(name): idx for idx, name in enumerate(msg.name)}
+        for name in names:
+            idx = name_to_idx.get(name)
+            if idx is None or idx >= len(msg.position):
+                continue
+            latest_by_name[name] = float(msg.position[idx])
+
+    sub = node.create_subscription(JointState, str(topic), _cb, 10)
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    try:
+        while rclpy.ok() and time.monotonic() < deadline:
+            if all(name in latest_by_name for name in names):
+                return [latest_by_name[name] for name in names]
+            rclpy.spin_once(node, timeout_sec=0.05)
+    finally:
+        node.destroy_subscription(sub)
+    return None
+
+
+def _wait_for_joint_motion_with_node(
+    node,
+    joint_names: Sequence[str],
+    baseline: Sequence[float],
+    *,
+    topic: str,
+    wait_s: float,
+    threshold_rad: float,
+) -> tuple[bool, float]:
+    import rclpy
+    from sensor_msgs.msg import JointState
+
+    names = [str(name) for name in joint_names]
+    baseline_values = [float(v) for v in baseline]
+    latest_by_name: dict[str, float] = {}
+    max_delta = 0.0
+
+    def _cb(msg: JointState) -> None:
+        nonlocal max_delta
+        name_to_idx = {str(name): idx for idx, name in enumerate(msg.name)}
+        for name in names:
+            idx = name_to_idx.get(name)
+            if idx is None or idx >= len(msg.position):
+                continue
+            latest_by_name[name] = float(msg.position[idx])
+        if all(name in latest_by_name for name in names):
+            current = [latest_by_name[name] for name in names]
+            max_delta = max(
+                max_delta,
+                max(_joint_delta_abs(current[i], baseline_values[i]) for i in range(len(names))),
+            )
+
+    sub = node.create_subscription(JointState, str(topic), _cb, 10)
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    try:
+        while rclpy.ok() and time.monotonic() < deadline:
+            if max_delta >= float(threshold_rad):
+                return True, float(max_delta)
+            rclpy.spin_once(node, timeout_sec=0.05)
+    finally:
+        node.destroy_subscription(sub)
+    return max_delta >= float(threshold_rad), float(max_delta)
+
+
 def _build_timed_joint_trajectory(
     *,
     joint_names: Sequence[str],
@@ -1378,7 +1536,16 @@ def _build_door_opening_cspace_path(
     ).strip().lower()
     if orientation_constraint not in ("door_relative", "rigid_grasp"):
         raise RuntimeError(f"unknown door_open_orientation_constraint={orientation_constraint!r}")
-    print(f"[ARM_DOOR][OPEN][ORI] constraint={orientation_constraint}")
+    orientation_lag = max(
+        0.0,
+        math.radians(float(getattr(args, "door_open_orientation_lag_deg", 0.0))),
+    )
+    ee_radial_offset = float(getattr(args, "door_open_handle_radial_offset_m", 0.0))
+    print(
+        f"[ARM_DOOR][OPEN][ORI] constraint={orientation_constraint} "
+        f"lag_deg={math.degrees(orientation_lag):.1f}"
+    )
+    print(f"[ARM_DOOR][OPEN][EE] radial_offset_m={ee_radial_offset:.3f}")
 
     collision_checker = None
     collision_source_world: dict[str, Any] | None = None
@@ -1508,11 +1675,16 @@ def _build_door_opening_cspace_path(
     desired_ee_poses: list[tuple[list[float], list[float]]] = []
     step_targets: list[dict[str, Any]] = []
     for idx, alpha in enumerate(planned_alphas, start=1):
-        xyz, quat_wxyz = _door_handle_pose_at(
+        xyz, _ = _door_handle_pose_at(
             alpha_rad=alpha,
             closed_xyz=closed_handle_xyz,
             closed_quat_wxyz=closed_handle_quat_wxyz,
             door_hinge_xyz=door_hinge_xyz,
+        )
+        orientation_alpha = max(0.0, float(alpha) - orientation_lag)
+        quat_wxyz = _quat_mul_wxyz(
+            _yaw_quat_wxyz(orientation_alpha),
+            closed_handle_quat_wxyz,
         )
         ee_xyz, ee_quat_wxyz = _pose_mul(
             xyz,
@@ -1520,8 +1692,18 @@ def _build_door_opening_cspace_path(
             inv_ee_handle_xyz,
             inv_ee_handle_quat,
         )
+        if abs(ee_radial_offset) > 1.0e-12:
+            offset_frac = min(1.0, max(0.0, float(alpha) / max(1.0e-9, goal_alpha)))
+            ee_xyz = _offset_point_radially_from_hinge(
+                ee_xyz,
+                door_hinge_xyz,
+                ee_radial_offset * offset_frac,
+            )
         if orientation_constraint == "door_relative":
-            ee_quat_wxyz = _quat_mul_wxyz(_yaw_quat_wxyz(alpha), grasp_ee_quat_wxyz)
+            ee_quat_wxyz = _quat_mul_wxyz(
+                _yaw_quat_wxyz(orientation_alpha),
+                grasp_ee_quat_wxyz,
+            )
         collision_cuboid_samples: list[Mapping[str, Any]] = []
         if collision_checker is not None and collision_source_world is not None:
             for collision_alpha in _opening_collision_alpha_samples(args, float(alpha)):
@@ -2336,7 +2518,7 @@ def _publish_real_opening_path_with_base(
     from capstone_pkg.planner.arm_rrt_common.path_publisher import (
         _build_joint_trajectory,
         _command_qos,
-        _future_stamp,
+        _command_stamp,
     )
     import rclpy
     from geometry_msgs.msg import Twist
@@ -2353,6 +2535,7 @@ def _publish_real_opening_path_with_base(
         raise RuntimeError("real opening base pose path length does not match arm path length")
     if len(publish_path) < 2:
         raise RuntimeError("real opening path must contain at least two waypoints for base cmd_vel")
+    _print_base_path_summary("[ARM_DOOR][OPEN][REAL][BASE][RAW]", publish_base_poses)
 
     smooth_window = int(getattr(args, "door_open_base_publish_smooth_window", 0))
     if smooth_window > 1:
@@ -2373,6 +2556,7 @@ def _publish_real_opening_path_with_base(
             "[ARM_DOOR][OPEN][REAL][BASE] "
             f"smoothed base publish poses window={smooth_window} changed={changed_count}/{len(publish_base_poses)}"
         )
+        _print_base_path_summary("[ARM_DOOR][OPEN][REAL][BASE][SMOOTH]", publish_base_poses)
 
     if bool(getattr(args, "door_open_wbc_qp", False)):
         if desired_ee_poses is None:
@@ -2417,6 +2601,7 @@ def _publish_real_opening_path_with_base(
             f"hard_constraint={bool(args.door_open_wbc_qp_hard_constraint)} "
             f"waypoints={len(publish_path)} max_task_error={max_task_error:.6f}"
         )
+        _print_base_path_summary("[ARM_DOOR][OPEN][REAL][BASE][WBC-QP]", publish_base_poses)
 
     if bool(getattr(args, "door_open_topp", True)):
         (
@@ -2426,6 +2611,7 @@ def _publish_real_opening_path_with_base(
             publish_arm_accelerations,
             publish_times,
         ) = _retime_opening_arm_base_path(args, publish_path, publish_base_poses)
+        _print_base_path_summary("[ARM_DOOR][OPEN][REAL][BASE][TOPP]", publish_base_poses)
     elif bool(args.door_open_base_publish_interp):
         old_count = len(publish_path)
         publish_path, publish_base_poses = _densify_opening_publish_samples(
@@ -2441,6 +2627,7 @@ def _publish_real_opening_path_with_base(
                 f"(max_step={float(args.door_open_base_publish_step_m):.3f}m, "
                 f"{float(args.door_open_base_publish_step_deg):.1f}deg)"
             )
+        _print_base_path_summary("[ARM_DOOR][OPEN][REAL][BASE][INTERP]", publish_base_poses)
 
     dt = max(1.0e-3, float(args.door_open_dt))
     arm_topic = str(args.real_left_topic if arm == "left" else args.real_right_topic)
@@ -2456,13 +2643,13 @@ def _publish_real_opening_path_with_base(
         JointTrajectory,
         arm_topic,
         _command_qos(
-            reliability=str(getattr(args, "publish_reliability", "best_effort")),
+            reliability=str(getattr(args, "publish_reliability", "reliable")),
             durability=(
                 "transient_local"
                 if bool(getattr(args, "publish_transient_local", False))
                 else str(getattr(args, "publish_durability", "volatile"))
             ),
-            depth=int(getattr(args, "publish_qos_depth", 1)),
+            depth=int(getattr(args, "publish_qos_depth", 10)),
         ),
     )
     base_pub = node.create_publisher(Twist, base_topic, 10)
@@ -2513,18 +2700,66 @@ def _publish_real_opening_path_with_base(
         f"JointTrajectory -> {arm_topic}, base Twist -> {base_topic} "
         f"(dt={dt:.3f}s, waypoints={len(publish_path)}, duration={duration_s:.3f}s)"
     )
-    for i in range(repeats):
-        traj_msg.header.stamp = _future_stamp(
-            node,
-            delay_s=float(getattr(args, "start_delay_s", 0.2)),
-        )
-        arm_pub.publish(traj_msg)
-        rclpy.spin_once(node, timeout_sec=0.0)
-        if i + 1 < repeats:
-            time.sleep(max(0.0, float(args.publish_period_s)))
-
     start_delay_s = max(0.0, float(getattr(args, "start_delay_s", 0.2)))
-    if start_delay_s > 0.0:
+    baseline = None
+    if bool(getattr(args, "door_open_arm_republish_if_static", True)):
+        baseline = _read_joint_sample_with_node(
+            node,
+            publish_joint_names,
+            topic=str(args.joint_state_topic),
+            wait_s=max(0.05, float(args.joint_state_wait_s)),
+        )
+        if baseline is None:
+            print(
+                "[ARM_DOOR][OPEN][REAL][ARM][WARN] "
+                f"could not read baseline joint state on {args.joint_state_topic}; "
+                "static-motion republish check disabled"
+            )
+
+    attempts = max(1, int(getattr(args, "door_open_arm_republish_attempts", 2)))
+    motion_ok = baseline is None
+    last_delta = 0.0
+    for attempt in range(1, attempts + 1):
+        for i in range(repeats):
+            traj_msg.header.stamp = _command_stamp(
+                node,
+                delay_s=start_delay_s,
+                zero_stamp=bool(getattr(args, "real_zero_trajectory_stamp", True)),
+            )
+            arm_pub.publish(traj_msg)
+            rclpy.spin_once(node, timeout_sec=0.0)
+            if i + 1 < repeats:
+                time.sleep(max(0.0, float(args.publish_period_s)))
+
+        if baseline is None:
+            break
+        if start_delay_s > 0.0:
+            time.sleep(start_delay_s)
+        motion_ok, last_delta = _wait_for_joint_motion_with_node(
+            node,
+            publish_joint_names,
+            baseline,
+            topic=str(args.joint_state_topic),
+            wait_s=max(0.0, float(args.door_open_arm_motion_check_s)),
+            threshold_rad=max(0.0, float(args.door_open_arm_motion_threshold_rad)),
+        )
+        print(
+            "[ARM_DOOR][OPEN][REAL][ARM] "
+            f"publish_attempt={attempt}/{attempts} "
+            f"motion_ok={motion_ok} max_delta={last_delta:.5f}rad"
+        )
+        if motion_ok:
+            break
+        if attempt < attempts:
+            print("[ARM_DOOR][OPEN][REAL][ARM][WARN] arm still static; republishing trajectory")
+
+    if baseline is not None and not motion_ok:
+        print(
+            "[ARM_DOOR][OPEN][REAL][ARM][WARN] "
+            f"arm did not exceed motion threshold after {attempts} publish attempt(s); "
+            "continuing with base command stream"
+        )
+    elif baseline is None and start_delay_s > 0.0:
         time.sleep(start_delay_s)
 
     max_linear = float(args.real_base_max_linear_mps)
@@ -2747,6 +2982,7 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
     print(f"[ARM_DOOR] target_xyz={target_xyz}")
     print(f"[ARM_DOOR] target_quat_xyzw={target_quat_xyzw}")
     print(f"[ARM_DOOR] handle_xyz={handle_xyz}")
+    print(f"[ARM_DOOR] door_open_ee_radial_offset_m={float(args.door_open_handle_radial_offset_m):.3f}")
     print(f"[ARM_DOOR] handle_quat_xyzw={handle_quat_xyzw}")
 
     _publish_world_collision_for_mujoco(args, resolved_world_yml)
@@ -2915,6 +3151,10 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
                         print(
                             "[ARM_DOOR][OPEN][BASE] "
                             f"final_pose_xyyaw={['%.3f' % v for v in open_base_poses[-1]]}"
+                        )
+                        _print_base_path_summary(
+                            "[ARM_DOOR][OPEN][BASE][PLANNED]",
+                            open_base_poses,
                         )
                 except Exception as exc:
                     print(f"[ARM_DOOR][OPEN][ERROR] {exc}")

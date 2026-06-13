@@ -359,14 +359,15 @@ def execute_single_arm_motion(plan: SingleArmMotionPlan, args) -> None:
                 publish_period_s=float(args.publish_period_s),
                 wait_ack_s=float(args.publish_wait_ack_s),
                 keep_alive_s=float(args.publish_keep_alive_s),
-                reliability=str(getattr(args, "publish_reliability", "best_effort")),
+                reliability=str(getattr(args, "publish_reliability", "reliable")),
                 durability=(
                     "transient_local"
                     if bool(getattr(args, "publish_transient_local", False))
                     else str(getattr(args, "publish_durability", "volatile"))
                 ),
-                qos_depth=int(getattr(args, "publish_qos_depth", 1)),
+                qos_depth=int(getattr(args, "publish_qos_depth", 10)),
                 start_time_delay_s=float(getattr(args, "start_delay_s", 0.2)),
+                zero_header_stamp=bool(getattr(args, "real_zero_trajectory_stamp", True)),
             )
             return
 
