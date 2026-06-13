@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
 import heapq
 import json
 import math
@@ -11,11 +12,11 @@ from typing import Any, Mapping, Sequence
 
 
 _PKG_ROOT = Path(__file__).resolve().parents[3]
+DOOR_MODEL_XML = str(_PKG_ROOT / "models" / "door_ffw_sg2.xml")
 DOOR_COLLISION_YAML = str(_PKG_ROOT / "models" / "door_collision.yaml")
+HANDLE_TARGET_X_OFFSET_M = -0.02
+HANDLE_TARGET_Z_OFFSET_M = 0.10
 
-HANDLE_CENTER_XYZ = (0.6, 0.0, 1.100)
-HANDLE_FRAME_XYZ = (0.6, 0.0, 1.000)
-DOOR_HINGE_XYZ = (0.660, -0.586, 0.925)
 DEFAULT_DOOR_UNLOCK_TOPIC = "/door_unlock"
 DOOR_HINGE_JOINT = "fridge_door_hinge_joint"
 DOOR_MOVING_COLLISION_NAMES = (
@@ -43,6 +44,77 @@ HANDLE_QUAT_XYZW = (
 _COLLISION_MODELS: Mapping[str, str] = {
     "door": DOOR_COLLISION_YAML,
 }
+
+
+@dataclass(frozen=True)
+class DoorModelFrames:
+    hinge_xyz: tuple[float, float, float]
+    handle_frame_xyz: tuple[float, float, float]
+    grasp_target_xyz: tuple[float, float, float]
+
+
+def _parse_xyz_attr(value: str | None) -> list[float]:
+    if value is None or not str(value).strip():
+        return [0.0, 0.0, 0.0]
+    parts = [float(v) for v in str(value).split()]
+    if len(parts) != 3:
+        raise RuntimeError(f"expected 3 xyz values, got {value!r}")
+    return parts
+
+
+def _add_xyz(a: Sequence[float], b: Sequence[float]) -> tuple[float, float, float]:
+    return tuple(float(a[i]) + float(b[i]) for i in range(3))
+
+
+def _load_door_model_frames(mujoco_xml: str) -> DoorModelFrames:
+    import xml.etree.ElementTree as ET
+
+    root = ET.parse(str(mujoco_xml)).getroot()
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        raise RuntimeError(f"door model has no worldbody: {mujoco_xml}")
+
+    sites: dict[str, tuple[float, float, float]] = {}
+    geoms: dict[str, tuple[float, float, float]] = {}
+
+    def walk_body(body, parent_xyz: Sequence[float]) -> None:
+        body_xyz = _add_xyz(parent_xyz, _parse_xyz_attr(body.get("pos")))
+        for child in body:
+            if child.tag == "site":
+                name = child.get("name")
+                if name:
+                    sites[str(name)] = _add_xyz(body_xyz, _parse_xyz_attr(child.get("pos")))
+            elif child.tag == "geom":
+                name = child.get("name")
+                if name:
+                    geoms[str(name)] = _add_xyz(body_xyz, _parse_xyz_attr(child.get("pos")))
+            elif child.tag == "body":
+                walk_body(child, body_xyz)
+
+    for body in worldbody.findall("body"):
+        walk_body(body, (0.0, 0.0, 0.0))
+
+    try:
+        hinge_xyz = sites["fridge_hinge_axis_site"]
+        handle_frame_xyz = sites["fridge_handle_center_site"]
+    except KeyError as exc:
+        raise RuntimeError(f"door model missing required site {exc.args[0]!r}") from exc
+
+    return DoorModelFrames(
+        hinge_xyz=hinge_xyz,
+        handle_frame_xyz=handle_frame_xyz,
+        grasp_target_xyz=(
+            handle_frame_xyz[0] + HANDLE_TARGET_X_OFFSET_M,
+            handle_frame_xyz[1],
+            handle_frame_xyz[2] + HANDLE_TARGET_Z_OFFSET_M,
+        ),
+    )
+
+
+_DOOR_MODEL_FRAMES = _load_door_model_frames(DOOR_MODEL_XML)
+HANDLE_CENTER_XYZ = _DOOR_MODEL_FRAMES.grasp_target_xyz
+HANDLE_FRAME_XYZ = _DOOR_MODEL_FRAMES.handle_frame_xyz
+DOOR_HINGE_XYZ = _DOOR_MODEL_FRAMES.hinge_xyz
 
 
 def _build_arm_door_parser():
@@ -556,8 +628,9 @@ def _door_handle_pose_at(
     alpha_rad: float,
     closed_xyz: Sequence[float],
     closed_quat_wxyz: Sequence[float],
+    door_hinge_xyz: Sequence[float],
 ) -> tuple[list[float], list[float]]:
-    hinge = [float(v) for v in DOOR_HINGE_XYZ]
+    hinge = [float(v) for v in door_hinge_xyz]
     rel = [float(closed_xyz[i]) - hinge[i] for i in range(3)]
     rel_rot = _rotate_z(rel, alpha_rad)
     xyz = [hinge[i] + rel_rot[i] for i in range(3)]
@@ -1073,10 +1146,11 @@ def _rotate_door_cuboid_pose(
     pose_wxyz: Sequence[float],
     *,
     alpha_rad: float,
+    door_hinge_xyz: Sequence[float],
 ) -> list[float]:
     if len(pose_wxyz) != 7:
         raise RuntimeError(f"cuboid pose must be [x,y,z,w,x,y,z], got {pose_wxyz}")
-    hinge = [float(v) for v in DOOR_HINGE_XYZ]
+    hinge = [float(v) for v in door_hinge_xyz]
     xyz = [float(v) for v in pose_wxyz[:3]]
     quat = [float(v) for v in pose_wxyz[3:7]]
     rel = [xyz[i] - hinge[i] for i in range(3)]
@@ -1090,6 +1164,7 @@ def _make_opening_dynamic_world(
     *,
     source_world: Mapping[str, Any],
     alpha_rad: float,
+    door_hinge_xyz: Sequence[float],
     ignore_names: Sequence[str],
 ) -> dict[str, Any]:
     import copy
@@ -1114,6 +1189,7 @@ def _make_opening_dynamic_world(
         item["pose"] = _rotate_door_cuboid_pose(
             item["pose"],
             alpha_rad=alpha_rad,
+            door_hinge_xyz=door_hinge_xyz,
         )
 
     world["cuboid"] = cuboids
@@ -1124,11 +1200,13 @@ def _make_opening_dynamic_world_yaml(
     *,
     source_world_yml: str,
     alpha_rad: float,
+    door_hinge_xyz: Sequence[float],
     ignore_names: Sequence[str],
 ) -> str:
     world = _make_opening_dynamic_world(
         source_world=_load_world_yaml(source_world_yml),
         alpha_rad=alpha_rad,
+        door_hinge_xyz=door_hinge_xyz,
         ignore_names=ignore_names,
     )
     return _write_temp_world_yaml(world)
@@ -1244,6 +1322,7 @@ def _build_door_opening_cspace_path(
     grasp_ee_quat_xyzw: Sequence[float],
     closed_handle_xyz: Sequence[float],
     closed_handle_quat_xyzw: Sequence[float],
+    door_hinge_xyz: Sequence[float],
     resolved_world_yml: str | None,
 ) -> tuple[list[str], list[str], list[list[float]], list[float], list[tuple[list[float], list[float]]], list[list[float]]]:
     from capstone_pkg.kinematics.curobo_ik import get_single_arm_ik
@@ -1365,7 +1444,7 @@ def _build_door_opening_cspace_path(
             lambda_step_rad=max(1.0e-4, math.radians(float(args.door_open_graph_lambda_step_deg))),
             base_motion_start_alpha_rad=math.radians(float(args.door_open_base_start_deg)),
             closed_handle_xyz=tuple(float(v) for v in closed_handle_xyz),
-            door_hinge_xyz=tuple(float(v) for v in DOOR_HINGE_XYZ),
+            door_hinge_xyz=tuple(float(v) for v in door_hinge_xyz),
             start_base_xyyaw=(0.0, 0.0, 0.0),
             opening_end_xyyaw=(
                 float(args.door_open_base_end_x),
@@ -1433,6 +1512,7 @@ def _build_door_opening_cspace_path(
             alpha_rad=alpha,
             closed_xyz=closed_handle_xyz,
             closed_quat_wxyz=closed_handle_quat_wxyz,
+            door_hinge_xyz=door_hinge_xyz,
         )
         ee_xyz, ee_quat_wxyz = _pose_mul(
             xyz,
@@ -1448,6 +1528,7 @@ def _build_door_opening_cspace_path(
                 dynamic_world = _make_opening_dynamic_world(
                     source_world=collision_source_world,
                     alpha_rad=float(collision_alpha),
+                    door_hinge_xyz=door_hinge_xyz,
                     ignore_names=collision_ignore_names,
                 )
                 cuboids = dynamic_world.get("cuboid", {}) or {}
@@ -2104,6 +2185,7 @@ def _validate_opening_dynamic_collision(
     *,
     cspace_path: Sequence[Sequence[float]],
     door_alphas_rad: Sequence[float],
+    door_hinge_xyz: Sequence[float],
     base_poses: Sequence[Sequence[float]] | None,
     resolved_world_yml: str | None,
 ) -> None:
@@ -2161,6 +2243,7 @@ def _validate_opening_dynamic_collision(
             world = _make_opening_dynamic_world(
                 source_world=source_world,
                 alpha_rad=float(collision_alpha),
+                door_hinge_xyz=door_hinge_xyz,
                 ignore_names=ignore_names,
             )
             cuboids = world.get("cuboid", {}) or {}
@@ -2636,6 +2719,7 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
     arm = normalize_arm_name(args.arm)
     target_xyz = [float(v) for v in args.target_xyz]
     target_quat_xyzw = [float(v) for v in args.target_quat_xyzw]
+    door_hinge_xyz = [float(v) for v in DOOR_HINGE_XYZ]
     handle_xyz = (
         [float(v) for v in args.handle_xyz]
         if args.handle_xyz is not None
@@ -2658,6 +2742,8 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
         print(f"[ARM_DOOR] world_yml={resolved_world_yml}")
 
     print(f"[ARM_DOOR] arm={arm}")
+    print(f"[ARM_DOOR] door_model_xml={DOOR_MODEL_XML}")
+    print(f"[ARM_DOOR] door_hinge_xyz={door_hinge_xyz}")
     print(f"[ARM_DOOR] target_xyz={target_xyz}")
     print(f"[ARM_DOOR] target_quat_xyzw={target_quat_xyzw}")
     print(f"[ARM_DOOR] handle_xyz={handle_xyz}")
@@ -2792,6 +2878,7 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
                             grasp_ee_quat_xyzw=target_quat_xyzw,
                             closed_handle_xyz=handle_xyz,
                             closed_handle_quat_xyzw=handle_quat_xyzw,
+                            door_hinge_xyz=door_hinge_xyz,
                             resolved_world_yml=resolved_world_yml,
                         )
                     )
@@ -2811,6 +2898,7 @@ def main_arm_door(argv: Sequence[str] | None = None) -> int:
                             args,
                             cspace_path=open_cspace_path,
                             door_alphas_rad=open_alphas,
+                            door_hinge_xyz=door_hinge_xyz,
                             base_poses=open_base_poses,
                             resolved_world_yml=resolved_world_yml,
                         )
