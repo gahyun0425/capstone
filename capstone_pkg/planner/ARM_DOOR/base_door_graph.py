@@ -24,6 +24,8 @@ class BaseDoorGraphConfig:
     opening_span_xyyaw: tuple[float, float, float]
     front_goal_xyyaw: tuple[float, float, float]
     front_goal_tol_m: float
+    front_goal_x_tol_m: float
+    front_goal_y_tol_m: float
     front_goal_tol_yaw_rad: float
     xy_step_m: float
     yaw_step_rad: float
@@ -163,12 +165,20 @@ def _front_goal_distance(cfg: BaseDoorGraphConfig, pose_xyyaw: Sequence[float]) 
     dx = float(pose_xyyaw[0]) - cfg.front_goal_xyyaw[0]
     dy = float(pose_xyyaw[1]) - cfg.front_goal_xyyaw[1]
     dyaw = _wrap_pi(float(pose_xyyaw[2]) - cfg.front_goal_xyyaw[2])
-    return math.hypot(dx, dy), abs(dyaw)
+    x_over = max(0.0, abs(dx) - cfg.front_goal_x_tol_m)
+    y_over = max(0.0, abs(dy) - cfg.front_goal_y_tol_m)
+    return math.hypot(x_over, y_over), abs(dyaw)
 
 
 def _is_front_goal(cfg: BaseDoorGraphConfig, pose_xyyaw: Sequence[float]) -> bool:
-    dist_xy, dist_yaw = _front_goal_distance(cfg, pose_xyyaw)
-    return dist_xy <= cfg.front_goal_tol_m and dist_yaw <= cfg.front_goal_tol_yaw_rad
+    dx = abs(float(pose_xyyaw[0]) - cfg.front_goal_xyyaw[0])
+    dy = abs(float(pose_xyyaw[1]) - cfg.front_goal_xyyaw[1])
+    dyaw = abs(_wrap_pi(float(pose_xyyaw[2]) - cfg.front_goal_xyyaw[2]))
+    return (
+        dx <= cfg.front_goal_x_tol_m
+        and dy <= cfg.front_goal_y_tol_m
+        and dyaw <= cfg.front_goal_tol_yaw_rad
+    )
 
 
 def _pose_in_bounds(
@@ -184,13 +194,15 @@ def _pose_in_bounds(
             cfg.start_base_xyyaw[0],
             open_center[0] - open_span[0],
             open_center[0] + open_span[0],
-            cfg.front_goal_xyyaw[0],
+            cfg.front_goal_xyyaw[0] - cfg.front_goal_x_tol_m,
+            cfg.front_goal_xyyaw[0] + cfg.front_goal_x_tol_m,
         ]
         ys = [
             cfg.start_base_xyyaw[1],
             open_center[1] - open_span[1],
             open_center[1] + open_span[1],
-            cfg.front_goal_xyyaw[1],
+            cfg.front_goal_xyyaw[1] - cfg.front_goal_y_tol_m,
+            cfg.front_goal_xyyaw[1] + cfg.front_goal_y_tol_m,
         ]
         yaws = [
             cfg.start_base_xyyaw[2],

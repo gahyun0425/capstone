@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Sequence
 
 import rclpy
@@ -56,12 +58,24 @@ from capstone_pkg.utils.config import (
 )
 
 
+_PKG_ROOT = Path(__file__).resolve().parents[3]
+DOOR_COLLISION_YAML = str(_PKG_ROOT / "models" / "door_collision.yaml")
 _COLLISION_MODELS = {
     "long_shelf": LONG_SHELF_YAML,
     "shelf": SHELF_YAML,
     "shelf_1": SHELF_YAML,
     "shelf_2": LONG_SHELF_YAML,
 }
+_DOORLESS_FRIDGE_REMOVE_CUBOIDS = (
+    "fridge_door_glass",
+    "fridge_door_right_frame",
+    "fridge_door_left_frame",
+    "fridge_door_top_frame",
+    "fridge_door_bottom_frame",
+    "fridge_handle_bar",
+    "fridge_handle_top_mount",
+    "fridge_handle_bottom_mount",
+)
 _ARM_PICKING_FINISH_DELAY_S = 5.0
 _GRIPPER_START_DELAY_AFTER_ARRIVAL_S = 3.0
 
@@ -77,13 +91,8 @@ _LEFT_SHELF_2_ALIGN_QUATERNION_XYZW = (
     0.5,
     0.5,
 )
-_SHELF_1_ALIGN_QUATERNION_XYZW = (
-    1.0,
-    0.0,
-    0.0,
-    0.0,
-)
-_SHELF_1_ALIGN_FIXED_X_M = 0.5
+_SHELF_1_ALIGN_FIXED_X_M = 0.35
+_SHELF_1_ALIGN_FIXED_Y_M = 0.1
 _SHELF_1_ALIGN_FIXED_Z_M = 1.2
 _GRASP_OBJECT_POSE_X_OFFSET_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_X_M = 0.01
@@ -189,14 +198,14 @@ def _build_align_target_pose(
     shelf_type = str(msg.shelf_type).strip().lower()
     if shelf_type == "shelf_1":
         pose.position.x = float(_SHELF_1_ALIGN_FIXED_X_M)
-        pose.position.y = float(msg.marker_position.y)
+        pose.position.y = float(_SHELF_1_ALIGN_FIXED_Y_M)
         pose.position.z = float(_SHELF_1_ALIGN_FIXED_Z_M)
     else:
         pose.position.x = float(fixed_x_m)
         pose.position.y = float(msg.marker_position.y)
         pose.position.z = float(msg.marker_position.z) + float(lift_z_m)
     if shelf_type == "shelf_1":
-        quat_xyzw = _SHELF_1_ALIGN_QUATERNION_XYZW
+        quat_xyzw = _LEFT_SHELF_2_ALIGN_QUATERNION_XYZW
     elif shelf_type == "shelf_2" and normalize_arm_name(selected_arm) == "left":
         quat_xyzw = _LEFT_SHELF_2_ALIGN_QUATERNION_XYZW
     else:
@@ -235,6 +244,33 @@ def _preferred_grasp_orientation() -> Quaternion:
             w=float(_PREFERRED_GRASP_QUATERNION_XYZW[3]),
         )
     )
+
+
+def _make_doorless_fridge_world_yml(source_world_yml: str = DOOR_COLLISION_YAML) -> str:
+    import yaml
+
+    with open(str(source_world_yml), "r", encoding="utf-8") as f:
+        loaded = yaml.safe_load(f)
+    raw = loaded if isinstance(loaded, dict) else {}
+    cuboids = raw.get("cuboid", {})
+    if not isinstance(cuboids, dict):
+        raise RuntimeError(f"door collision yaml cuboid entry must be a mapping: {source_world_yml}")
+
+    raw["cuboid"] = {
+        str(name): item
+        for name, item in cuboids.items()
+        if str(name) not in _DOORLESS_FRIDGE_REMOVE_CUBOIDS
+    }
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="arm_picking_doorless_fridge_",
+        suffix=".yaml",
+        delete=False,
+    )
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
+    return str(tmp_path)
 
 
 def _build_object_center_fallback_pose(
@@ -578,7 +614,11 @@ class ArmPickingCoordinator(Node):
             depth=1,
         )
         self._state_lock = threading.Lock()
+        self._armed = False
         self._sequence_active = False
+        self._align_rx_seq = 0
+        self._activation_align_seq = 0
+        self._doorless_fridge_world_yml: str | None = None
         self._grasp_cv = threading.Condition()
         self._latest_grasp_msg: ObjectGrasp | None = None
         self._latest_grasp_seq = 0
@@ -587,11 +627,23 @@ class ArmPickingCoordinator(Node):
 
         self._run_startup_warmup()
 
+        self._start_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1,
+        )
         self._sub = self.create_subscription(
             ObjectAlign,
             str(args.object_align_topic),
             self._on_object_align,
             self.qos_cmd,
+        )
+        self._start_sub = self.create_subscription(
+            Bool,
+            str(args.arm_picking_start_topic),
+            self._on_start,
+            self._start_qos,
         )
         self._grasp_sub = self.create_subscription(
             ObjectGrasp,
@@ -611,19 +663,20 @@ class ArmPickingCoordinator(Node):
             str(args.arm_picking_finish_topic),
             self.qos_cmd,
         )
+        self._one_step_finish_pub = self.create_publisher(
+            Bool,
+            str(args.one_step_finish_topic),
+            self.qos_cmd,
+        )
         self.get_logger().info(
             "ARM_PICKING align node ready: "
+            f"start_sub={args.arm_picking_start_topic}, "
             f"align_sub={args.object_align_topic}, grasp_sub={args.object_grasp_topic}, "
             f"gripper_start_pub={args.gripper_start_topic}, "
-            f"gripper_finish_sub={args.gripper_finish_topic}, arm_picking_finish_pub={args.arm_picking_finish_topic}"
+            f"gripper_finish_sub={args.gripper_finish_topic}, "
+            f"arm_picking_finish_pub={args.arm_picking_finish_topic}, "
+            f"one_step_finish_pub={args.one_step_finish_topic}"
         )
-
-    def _set_active(self) -> bool:
-        with self._state_lock:
-            if self._sequence_active:
-                return False
-            self._sequence_active = True
-            return True
 
     def _reset_active(self) -> None:
         with self._state_lock:
@@ -633,6 +686,35 @@ class ArmPickingCoordinator(Node):
         with self._state_lock:
             return bool(self._sequence_active)
 
+    def _get_doorless_fridge_world_yml(self) -> str:
+        if self._doorless_fridge_world_yml is None:
+            self._doorless_fridge_world_yml = _make_doorless_fridge_world_yml()
+            self.get_logger().info(
+                "Prepared shelf_1 doorless fridge collision world: "
+                f"{self._doorless_fridge_world_yml}"
+            )
+        return str(self._doorless_fridge_world_yml)
+
+    def _on_start(self, msg: Bool) -> None:
+        if not bool(msg.data):
+            return
+        with self._state_lock:
+            if self._sequence_active:
+                self.get_logger().warning(
+                    "Ignoring arm_picking_start: sequence already active"
+                )
+                return
+            if self._armed:
+                self.get_logger().warning(
+                    "Ignoring arm_picking_start: already waiting for ObjectAlign"
+                )
+                return
+            self._armed = True
+            self._activation_align_seq = self._align_rx_seq
+        self.get_logger().info(
+            "Accepted arm_picking_start; waiting for a new ObjectAlign"
+        )
+
     def _iter_startup_world_ymls(self) -> list[str | None]:
         candidates: list[str | None] = [
             _resolve_world_yml(
@@ -641,6 +723,7 @@ class ArmPickingCoordinator(Node):
                 default_world_yml=None,
             ),
             *[str(path) for path in _COLLISION_MODELS.values()],
+            self._get_doorless_fridge_world_yml(),
             None,
         ]
         out: list[str | None] = []
@@ -699,9 +782,19 @@ class ArmPickingCoordinator(Node):
         )
 
     def _on_object_align(self, msg: ObjectAlign) -> None:
-        if not self._set_active():
-            self.get_logger().warning("Ignoring ObjectAlign: sequence already active")
-            return
+        with self._state_lock:
+            self._align_rx_seq += 1
+            align_seq = self._align_rx_seq
+            if not self._armed:
+                return
+            if align_seq <= self._activation_align_seq:
+                return
+            if self._sequence_active:
+                self.get_logger().warning("Ignoring ObjectAlign: sequence already active")
+                return
+            self._armed = False
+            self._sequence_active = True
+        self.get_logger().info("Accepted ObjectAlign; starting ARM_PICKING sequence")
 
         worker = threading.Thread(
             target=self._execute_align,
@@ -750,8 +843,13 @@ class ArmPickingCoordinator(Node):
             self._gripper_finish_cv.notify_all()
         self.get_logger().info("Received gripper_finish=True")
 
-    def _resolve_world_yml_from_msg(self, msg: ObjectAlign) -> str | None:
-        shelf_type = str(msg.shelf_type).strip()
+    def _resolve_world_yml_from_msg(
+        self,
+        msg: ObjectAlign,
+        *,
+        shelf_type: str | None = None,
+    ) -> str | None:
+        shelf_type = str(msg.shelf_type if shelf_type is None else shelf_type).strip()
         if shelf_type:
             mapped = _COLLISION_MODELS.get(shelf_type)
             if mapped is not None:
@@ -2095,14 +2193,32 @@ class ArmPickingCoordinator(Node):
             f"Published arm_picking_finish=True for arm={normalize_arm_name(arm)} stage={stage}"
         )
 
-    def _publish_arm_picking_finish_after_motion_complete(self, arm: str, *, stage: str) -> None:
+    def _publish_one_step_finish(self, arm: str, *, stage: str) -> None:
+        msg = Bool()
+        msg.data = True
+        self._one_step_finish_pub.publish(msg)
         self.get_logger().info(
-            "[ARM_PICKING] motion completed; waiting before publishing arm_picking_finish: "
+            f"Published one_step_finish=True for arm={normalize_arm_name(arm)} stage={stage}"
+        )
+
+    def _publish_finish_after_motion_complete(
+        self,
+        arm: str,
+        *,
+        stage: str,
+        use_one_step_finish: bool = False,
+    ) -> None:
+        topic_label = "one_step_finish" if use_one_step_finish else "arm_picking_finish"
+        self.get_logger().info(
+            f"[ARM_PICKING] motion completed; waiting before publishing {topic_label}: "
             f"arm={normalize_arm_name(arm)} stage={stage}"
             f" delay_s={_ARM_PICKING_FINISH_DELAY_S:.1f}"
         )
         time.sleep(_ARM_PICKING_FINISH_DELAY_S)
-        self._publish_arm_picking_finish(arm, stage=stage)
+        if use_one_step_finish:
+            self._publish_one_step_finish(arm, stage=stage)
+        else:
+            self._publish_arm_picking_finish(arm, stage=stage)
 
     def _execute_grasp_sequence(
         self,
@@ -2110,6 +2226,7 @@ class ArmPickingCoordinator(Node):
         selected_arm: str,
         base_world_yml: str | None,
         shelf_type: str,
+        use_one_step_finish_on_complete: bool = False,
     ) -> None:
         shelf_type_key = str(shelf_type).strip().lower()
         is_shelf_1 = shelf_type_key == "shelf_1"
@@ -2212,7 +2329,11 @@ class ArmPickingCoordinator(Node):
                         f"arm={selected_arm} object_center={_pose_position_xyz(object_pose)} "
                         f"object_size={_vector3_xyz(object_size)}"
                     )
-                    self._publish_arm_picking_finish_after_motion_complete(selected_arm, stage="grasp")
+                    self._publish_finish_after_motion_complete(
+                        selected_arm,
+                        stage="grasp",
+                        use_one_step_finish=use_one_step_finish_on_complete,
+                    )
                     return
 
                 lift_pose = _offset_pose_z(grasp_target_pose, float(self._args.post_grasp_lift_z_m))
@@ -2242,7 +2363,11 @@ class ArmPickingCoordinator(Node):
                     f"arm={selected_arm} object_center={_pose_position_xyz(object_pose)} "
                     f"object_size={_vector3_xyz(object_size)}"
                 )
-                self._publish_arm_picking_finish_after_motion_complete(selected_arm, stage="grasp")
+                self._publish_finish_after_motion_complete(
+                    selected_arm,
+                    stage="grasp",
+                    use_one_step_finish=use_one_step_finish_on_complete,
+                )
                 return
             except Exception as exc:
                 grasp_attempt += 1
@@ -2256,9 +2381,25 @@ class ArmPickingCoordinator(Node):
 
     def _execute_align(self, msg: ObjectAlign) -> None:
         try:
-            selected_arm = normalize_arm_name(msg.selected_arm)
+            requested_shelf_type = str(msg.shelf_type).strip().lower()
+            shelf_1_single_left_align = requested_shelf_type == "shelf_1"
+            sequence_shelf_type = (
+                "shelf_2" if shelf_1_single_left_align else requested_shelf_type
+            )
+            selected_arm = (
+                "left"
+                if shelf_1_single_left_align
+                else normalize_arm_name(msg.selected_arm)
+            )
             other_arm = "right" if selected_arm == "left" else "left"
-            world_yml = self._resolve_world_yml_from_msg(msg)
+            world_yml = (
+                self._get_doorless_fridge_world_yml()
+                if shelf_1_single_left_align
+                else self._resolve_world_yml_from_msg(
+                    msg,
+                    shelf_type=sequence_shelf_type,
+                )
+            )
             target_pose = _build_align_target_pose(
                 msg,
                 selected_arm=selected_arm,
@@ -2270,6 +2411,8 @@ class ArmPickingCoordinator(Node):
                 "[ARM_PICKING] start align: "
                 f"aruco_id={int(msg.aruco_id)} arm={selected_arm} "
                 f"shelf_type='{str(msg.shelf_type).strip()}' "
+                f"sequence_shelf_type='{sequence_shelf_type}' "
+                f"world_yml={world_yml} "
                 f"target=({target_pose.position.x:.3f}, {target_pose.position.y:.3f}, {target_pose.position.z:.3f})"
             )
             _publish_world_collision_for_mujoco(self._args, world_yml)
@@ -2280,31 +2423,44 @@ class ArmPickingCoordinator(Node):
                 target_pose=target_pose,
                 world_yml=world_yml,
             )
-            other_plan = self._plan_other_arm_zero(
-                stage="align_other_zero",
-                arm=other_arm,
-                q_start_cspace=selected_plan.q_start_cspace,
-                cspace_joint_names=selected_plan.cspace_joint_names,
-                world_yml=world_yml,
-            )
-            full_path = _build_combined_full_path(
-                selected_plan=selected_plan,
-                other_plan=other_plan,
-                selected_arm=selected_arm,
-                other_arm=other_arm,
-            )
-            self._wait_for_both_arms(
-                stage="align",
-                plan=selected_plan,
-                full_path=full_path,
-                selected_arm=selected_arm,
-                other_arm=other_arm,
-            )
+            if shelf_1_single_left_align:
+                full_path = [list(q) for q in selected_plan.spline_path]
+                self.get_logger().info(
+                    "[ARM_PICKING] shelf_1 align uses left arm only; "
+                    "right arm will not receive any align command"
+                )
+                self._wait_for_single_arm(
+                    stage="align",
+                    plan=selected_plan,
+                )
+                record_other_arm = f"{other_arm}_uncontrolled"
+            else:
+                other_plan = self._plan_other_arm_zero(
+                    stage="align_other_zero",
+                    arm=other_arm,
+                    q_start_cspace=selected_plan.q_start_cspace,
+                    cspace_joint_names=selected_plan.cspace_joint_names,
+                    world_yml=world_yml,
+                )
+                full_path = _build_combined_full_path(
+                    selected_plan=selected_plan,
+                    other_plan=other_plan,
+                    selected_arm=selected_arm,
+                    other_arm=other_arm,
+                )
+                self._wait_for_both_arms(
+                    stage="align",
+                    plan=selected_plan,
+                    full_path=full_path,
+                    selected_arm=selected_arm,
+                    other_arm=other_arm,
+                )
+                record_other_arm = other_arm
             self._maybe_save_alignment(
                 AlignExecutionRecord(
                     selected_arm=selected_arm,
-                    other_arm=other_arm,
-                    shelf_type=str(msg.shelf_type).strip(),
+                    other_arm=record_other_arm,
+                    shelf_type=sequence_shelf_type,
                     world_yml=world_yml,
                     target_pose=_copy_pose(target_pose),
                     marker_position=_copy_point(msg.marker_position),
@@ -2314,11 +2470,12 @@ class ArmPickingCoordinator(Node):
                 )
             )
             self.get_logger().info("[ARM_PICKING] align sequence completed; waiting for ObjectGrasp")
-            self._publish_arm_picking_finish_after_motion_complete(selected_arm, stage="align")
+            self._publish_finish_after_motion_complete(selected_arm, stage="align")
             self._execute_grasp_sequence(
                 selected_arm=selected_arm,
                 base_world_yml=world_yml,
-                shelf_type=str(msg.shelf_type).strip(),
+                shelf_type=sequence_shelf_type,
+                use_one_step_finish_on_complete=shelf_1_single_left_align,
             )
         except Exception as exc:
             self.get_logger().error(f"ARM_PICKING align sequence failed: {exc}")
@@ -2333,6 +2490,11 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
         default_collision_model="long_shelf",
     )
     parser.set_defaults(plot_path=False, arrival_max_retries=-1)
+    parser.add_argument(
+        "--arm_picking_start_topic",
+        default="/arm_picking_start",
+        help="topic name used to arm ObjectAlign/ObjectGrasp processing with Bool(True)",
+    )
     parser.add_argument(
         "--object_align_topic",
         default="/object_align_result",
@@ -2362,6 +2524,11 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
         "--arm_picking_finish_topic",
         default="/arm_picking_finish",
         help="topic name used to publish completion of the full arm picking sequence",
+    )
+    parser.add_argument(
+        "--one_step_finish_topic",
+        default="/one_step_finish",
+        help="topic name used to publish shelf_1 completion before ARM_DOOR closes the door",
     )
     parser.add_argument(
         "--align_fixed_x_m",

@@ -5,6 +5,7 @@ import json
 import math
 import threading
 import time
+from pathlib import Path
 from typing import Sequence
 
 import rclpy
@@ -53,6 +54,10 @@ _DEFAULT_LEFT_QUAT_XYZW = (0.5, 0.5, 0.5, 0.5)
 _DEFAULT_RIGHT_XYZ = (0.50, -0.20, 1.00)
 _DEFAULT_RIGHT_QUAT_XYZW = (0.5, -0.5, 0.5, -0.5)
 _ZERO_GOAL_TOL = 1.0e-4
+_PKG_ROOT = Path(__file__).resolve().parents[3]
+_DEFAULT_ARM_CART_PICKING_TRAJECTORY = (
+    _PKG_ROOT / "data" / "arm_cart_picking_trajectory.json"
+)
 
 
 def _command_qos() -> QoSProfile:
@@ -238,6 +243,42 @@ def _combine_active_joint_paths(
     return full_path
 
 
+def _load_dual_arm_trajectory_json(path: str) -> tuple[list[list[float]], dict]:
+    with open(str(path), "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"trajectory json must contain an object: {path}")
+
+    cspace_joint_names = payload.get("cspace_joint_names")
+    if [str(name) for name in cspace_joint_names or []] != list(CSPACE_JOINT_NAMES_14):
+        raise RuntimeError(
+            "trajectory json cspace_joint_names do not match ARM_INIT joint order"
+        )
+
+    raw_path = payload.get("combined_path")
+    if not isinstance(raw_path, list) or not raw_path:
+        raise RuntimeError("trajectory json must contain non-empty combined_path")
+
+    q_path: list[list[float]] = []
+    for idx, row in enumerate(raw_path):
+        if not isinstance(row, list) or len(row) != len(CSPACE_JOINT_NAMES_14):
+            raise RuntimeError(
+                f"trajectory combined_path[{idx}] must have "
+                f"{len(CSPACE_JOINT_NAMES_14)} values"
+            )
+        q_path.append([float(v) for v in row])
+
+    publish_dt = float(payload.get("publish_dt", 0.0) or 0.0)
+    info = {
+        "path": str(path),
+        "mode": str(payload.get("mode", "")),
+        "path_len": len(q_path),
+        "publish_dt": publish_dt,
+        "q_goal_cspace": [float(v) for v in payload.get("q_goal_cspace", q_path[-1])],
+    }
+    return q_path, info
+
+
 def _retry_attempt_limit(max_retries: int) -> int | None:
     retries = int(max_retries)
     if retries <= 0:
@@ -375,6 +416,11 @@ def build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="validate the synchronized dual-arm path in collision after merging",
+    )
+    ap.add_argument(
+        "--arm_cart_picking_trajectory",
+        default=str(_DEFAULT_ARM_CART_PICKING_TRAJECTORY),
+        help="dual-arm trajectory json used after all arm joints reach zero",
     )
     ap.add_argument(
         "--startup_warmup",
@@ -1327,6 +1373,82 @@ class ArmInitNode(Node):
             f"last max_abs_err={last_err:.6f}"
         )
 
+    def _plan_all_arms_zero_path(
+        self,
+        q_start_cspace: Sequence[float],
+    ) -> tuple[list[list[float]] | None, dict]:
+        q_goal_zero = [0.0 for _ in CSPACE_JOINT_NAMES_14]
+        if _all_joints_zero(q_start_cspace):
+            self.get_logger().info(
+                "[ARM_INIT] all arm joints are already at zero; skipping zero planning"
+            )
+            return None, {"skipped": True, "reason": "already_zero"}
+
+        self.get_logger().info("[ARM_INIT] planning both arms to all-zero joint pose")
+        left_out = _plan_single_arm_from_dual_goal(
+            arm="left",
+            robot_yml=str(self._args.robot_yml),
+            joint_limit_yml=str(self._args.joint_limit_yml),
+            q_start_cspace=q_start_cspace,
+            q_goal_dual=q_goal_zero,
+            world_yml=self._resolved_world_yml,
+            cpu=bool(self._args.cpu),
+            args=self._args,
+        )
+        self.get_logger().info(
+            f"[ARM_INIT] left zero path_len={len(left_out.path)} "
+            f"iters={left_out.stats.iters} time={left_out.stats.time_sec:.3f}s"
+        )
+
+        right_out = _plan_single_arm_from_dual_goal(
+            arm="right",
+            robot_yml=str(self._args.robot_yml),
+            joint_limit_yml=str(self._args.joint_limit_yml),
+            q_start_cspace=q_start_cspace,
+            q_goal_dual=q_goal_zero,
+            world_yml=self._resolved_world_yml,
+            cpu=bool(self._args.cpu),
+            args=self._args,
+        )
+        self.get_logger().info(
+            f"[ARM_INIT] right zero path_len={len(right_out.path)} "
+            f"iters={right_out.stats.iters} time={right_out.stats.time_sec:.3f}s"
+        )
+
+        zero_path = _synchronize_single_arm_paths(
+            q_start_cspace=q_start_cspace,
+            left_path_full=[[float(v) for v in row] for row in left_out.path],
+            right_path_full=[[float(v) for v in row] for row in right_out.path],
+        )
+        self.get_logger().info(
+            f"[ARM_INIT] synchronized all-zero path_len={len(zero_path)}"
+        )
+
+        if bool(getattr(self._args, "validate_combined_path", True)):
+            self.get_logger().info("[ARM_INIT] validating synchronized all-zero path")
+            _validate_dual_path(
+                zero_path,
+                robot_yml=str(self._args.robot_yml),
+                cpu=bool(self._args.cpu),
+                world_yml=self._resolved_world_yml,
+            )
+            self.get_logger().info("[ARM_INIT] synchronized all-zero path is collision-free")
+
+        return zero_path, {
+            "skipped": False,
+            "q_goal_cspace": q_goal_zero,
+            "left_tbrrt": {
+                "iters": int(left_out.stats.iters),
+                "time_sec": float(left_out.stats.time_sec),
+                "path_len": int(len(left_out.path)),
+            },
+            "right_tbrrt": {
+                "iters": int(right_out.stats.iters),
+                "time_sec": float(right_out.stats.time_sec),
+                "path_len": int(len(right_out.path)),
+            },
+        }
+
     def _plan_dual_target_path(
         self,
         q_start_cspace: Sequence[float],
@@ -1440,7 +1562,10 @@ class ArmInitNode(Node):
     def _publish_dual_target_path(
         self,
         q_path: Sequence[Sequence[float]],
+        *,
+        publish_dt: float | None = None,
     ) -> None:
+        dt = float(self._args.publish_dt if publish_dt is None else publish_dt)
         left_path = _project_full_path_to_active(
             q_path,
             active_joint_names=LEFT_JOINTS,
@@ -1485,7 +1610,7 @@ class ArmInitNode(Node):
                     ]
                     self._send_follow_joint_trajectory_group(
                         action_commands,
-                        dt=float(self._args.publish_dt),
+                        dt=dt,
                         wait_server_s=float(self._args.action_wait_server_s),
                         wait_result_s=float(self._args.action_wait_result_s),
                         start_time_delay_s=float(
@@ -1499,7 +1624,7 @@ class ArmInitNode(Node):
 
             self._publish_joint_trajectory_group(
                 topic_commands,
-                dt=float(self._args.publish_dt),
+                dt=dt,
                 start_time_delay_s=float(getattr(self._args, "start_delay_s", 0.2)),
             )
             return
@@ -1508,13 +1633,17 @@ class ArmInitNode(Node):
             list(CSPACE_JOINT_NAMES_14),
             q_path,
             topic=str(self._args.publish_topic),
-            dt=float(self._args.publish_dt),
+            dt=dt,
         )
 
     def _execute_dual_target_path(
         self,
         q_path: Sequence[Sequence[float]],
+        *,
+        publish_dt: float | None = None,
+        stage_label: str = "dual target",
     ) -> None:
+        dt = float(self._args.publish_dt if publish_dt is None else publish_dt)
         left_path = _project_full_path_to_active(
             q_path,
             active_joint_names=LEFT_JOINTS,
@@ -1567,39 +1696,39 @@ class ArmInitNode(Node):
                     )
                     self.get_logger().warning(
                         f"[ARRIVAL] retry {_format_attempt(attempt_idx, max_attempts)} "
-                        "for arm_init dual target: "
+                        f"for arm_init {stage_label}: "
                         f"left at {left_desc}, right at {right_desc}."
                     )
                 except RuntimeError as exc:
                     self.get_logger().warning(
                         f"[ARRIVAL] retry {_format_attempt(attempt_idx, max_attempts)} "
-                        "for arm_init dual target: "
+                        f"for arm_init {stage_label}: "
                         f"failed to read current joints ({exc}); re-publishing full path."
                     )
             else:
                 self.get_logger().info(
-                    "[TRAJ] dual target trajectory ready; publishing: "
-                    f"waypoints={len(cmd_path)}"
+                    f"[TRAJ] {stage_label} trajectory ready; publishing: "
+                    f"waypoints={len(cmd_path)} dt={dt:.4f}"
                 )
 
             try:
-                self._publish_dual_target_path(cmd_path)
+                self._publish_dual_target_path(cmd_path, publish_dt=dt)
             except RuntimeError as exc:
                 attempt_idx += 1
                 if max_attempts is not None and attempt_idx >= max_attempts:
                     raise RuntimeError(
-                        "Failed to publish arm_init dual target command after "
+                        f"Failed to publish arm_init {stage_label} command after "
                         f"{attempt_idx} attempt(s): {exc}"
                     ) from exc
                 self.get_logger().warning(
                     f"[ARRIVAL] publish attempt {_format_attempt(attempt_idx - 1, max_attempts)} "
-                    f"failed for arm_init dual target: {exc}. Retrying."
+                    f"failed for arm_init {stage_label}: {exc}. Retrying."
                 )
                 continue
 
             wait_s = max(
                 2.0,
-                float(max(0, len(cmd_path) - 1)) * float(self._args.publish_dt) + 2.0,
+                float(max(0, len(cmd_path) - 1)) * dt + 2.0,
             )
             configured_wait_s = float(getattr(self._args, "arrival_wait_s", -1.0))
             if configured_wait_s >= 0.0:
@@ -1623,25 +1752,25 @@ class ArmInitNode(Node):
             if not failures:
                 if attempt_idx > 0:
                     self.get_logger().info(
-                        "[ARRIVAL] arm_init dual target confirmed after retry."
+                        f"[ARRIVAL] arm_init {stage_label} confirmed after retry."
                     )
                 return
 
             last_failure = "; ".join(failures)
             attempt_idx += 1
             self.get_logger().warning(
-                f"[ARRIVAL] arm_init dual target not confirmed after attempt "
+                f"[ARRIVAL] arm_init {stage_label} not confirmed after attempt "
                 f"{_format_attempt(attempt_idx - 1, max_attempts)}: {last_failure}. "
                 "Re-publishing toward the remaining path."
             )
 
         if max_attempts is None:
             raise RuntimeError(
-                "Failed to confirm arm_init dual target arrival after "
+                f"Failed to confirm arm_init {stage_label} arrival after "
                 f"infinite retry loop interruption; {last_failure}"
             )
         raise RuntimeError(
-            "Failed to confirm arm_init dual target arrival after "
+            f"Failed to confirm arm_init {stage_label} arrival after "
             f"{max_attempts} attempt(s); {last_failure}"
         )
 
@@ -1654,26 +1783,51 @@ class ArmInitNode(Node):
                 list(CSPACE_JOINT_NAMES_14),
                 wait_s=float(self._args.joint_state_wait_s),
             )
-            if _all_joints_zero(q_start_cspace):
-                self.get_logger().info(
-                    "[ARM_INIT] all joints are already at zero; skipping single-arm init "
-                    "and starting dual-arm target planning immediately"
-                )
-            else:
-                init_plan = self._run_single_arm_init(arm, q_start_cspace)
-                if init_plan is not None:
-                    self._execute_single_arm_plan(init_plan)
 
-            q_after_init = self._wait_for_joint_sample(
+            zero_path, zero_plan_info = self._plan_all_arms_zero_path(q_start_cspace)
+            if zero_path is not None:
+                self._execute_dual_target_path(
+                    zero_path,
+                    publish_dt=float(self._args.publish_dt),
+                    stage_label="all-zero",
+                )
+
+            q_after_zero = self._wait_for_joint_sample(
                 list(CSPACE_JOINT_NAMES_14),
                 wait_s=float(self._args.joint_state_wait_s),
             )
-            target_path, target_plan_info = self._plan_dual_target_path(q_after_init)
-            self.get_logger().info(
-                "[ARM_INIT] starting planned dual-arm target trajectory "
-                f"path_len={len(target_path)}"
+            target_path, target_plan_info = _load_dual_arm_trajectory_json(
+                str(self._args.arm_cart_picking_trajectory)
             )
-            self._execute_dual_target_path(target_path)
+            target_dt = (
+                float(target_plan_info["publish_dt"])
+                if float(target_plan_info.get("publish_dt", 0.0)) > 0.0
+                else float(self._args.publish_dt)
+            )
+            first_delta = max(
+                _wrapped_joint_delta(float(a), float(b))
+                for a, b in zip(q_after_zero, target_path[0])
+            )
+            self.get_logger().info(
+                "[ARM_INIT] starting arm-cart picking trajectory from json: "
+                f"path={target_plan_info['path']} path_len={len(target_path)} "
+                f"dt={target_dt:.4f} first_delta_from_zero={first_delta:.6f}"
+            )
+            if bool(getattr(self._args, "validate_combined_path", True)):
+                self.get_logger().info("[ARM_INIT] validating arm-cart picking trajectory")
+                _validate_dual_path(
+                    target_path,
+                    robot_yml=str(self._args.robot_yml),
+                    cpu=bool(self._args.cpu),
+                    world_yml=self._resolved_world_yml,
+                )
+                self.get_logger().info("[ARM_INIT] arm-cart picking trajectory is collision-free")
+
+            self._execute_dual_target_path(
+                target_path,
+                publish_dt=target_dt,
+                stage_label="arm-cart picking trajectory",
+            )
 
             if self._args.save:
                 payload = {
@@ -1681,17 +1835,8 @@ class ArmInitNode(Node):
                     "arm": arm,
                     "world_yml": self._resolved_world_yml,
                     "q_start_cspace": [float(v) for v in q_start_cspace],
-                    "q_after_init_cspace": [float(v) for v in q_after_init],
-                    "target": {
-                        "left_xyz": [float(v) for v in self._args.left_xyz],
-                        "left_quat_xyzw": [
-                            float(v) for v in self._args.left_quat_xyzw
-                        ],
-                        "right_xyz": [float(v) for v in self._args.right_xyz],
-                        "right_quat_xyzw": [
-                            float(v) for v in self._args.right_quat_xyzw
-                        ],
-                    },
+                    "q_after_zero_cspace": [float(v) for v in q_after_zero],
+                    "zero_plan": zero_plan_info,
                     "target_plan": target_plan_info,
                     "combined_path": [[float(v) for v in row] for row in target_path],
                     "left_path": _project_full_path_to_active(
@@ -1702,7 +1847,7 @@ class ArmInitNode(Node):
                         target_path,
                         active_joint_names=RIGHT_JOINTS,
                     ),
-                    "publish_dt": float(self._args.publish_dt),
+                    "publish_dt": target_dt,
                 }
                 with open(str(self._args.save), "w", encoding="utf-8") as f:
                     json.dump(payload, f, indent=2)
