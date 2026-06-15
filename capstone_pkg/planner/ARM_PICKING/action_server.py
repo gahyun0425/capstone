@@ -109,13 +109,17 @@ _PREFERRED_GRASP_QUATERNION_XYZW = (
     0.7071067811865475,
     5.551115123125783e-17,
 )
-_SNACK_FALLBACK_Y_OFFSET_M = 0.07
+_SNACK_FALLBACK_Y_OFFSET_M = 0.03
 _SNACK_FALLBACK_Z_OFFSET_M = 0.03
 _SNACK_FALLBACK_YAW_OFFSET_RAD = -0.5 * math.pi
 _GRASP_IK_CANDIDATE_BATCH_SIZE = 3
 _GRASP_FALLBACK_Z_OFFSET_M = 0.03
 _GRASP_FALLBACK_X_OFFSET_M = -0.0
 _ZERO_JOINT_TOL = 1.0e-4
+
+
+class FixedZRetreatIKError(RuntimeError):
+    pass
 
 
 def _copy_pose(pose: Pose) -> Pose:
@@ -1634,7 +1638,7 @@ class ArmPickingCoordinator(Node):
             atol=float(self._args.ik_goal_dedupe_tol),
         )
         if not cand_q:
-            raise RuntimeError("IK failed for fixed-z retreat target pose")
+            raise FixedZRetreatIKError("IK failed for fixed-z retreat target pose")
 
         out = plan_single_arm_tbrrt_batch_conext_fixed_ee_z(
             robot_yml=self._args.robot_yml,
@@ -2464,13 +2468,25 @@ class ArmPickingCoordinator(Node):
 
                     if is_shelf_2:
                         retreat_pose = _build_post_grasp_staging_pose(selected_arm, raise_pose)
-                        retreat_plan = self._plan_selected_arm_fixed_ee_z(
-                            stage="retreat",
-                            arm=selected_arm,
-                            target_pose=retreat_pose,
-                            world_yml=object_world_yml,
-                            q_start_cspace=raise_plan.q_goal_cspace,
-                        )
+                        try:
+                            retreat_plan = self._plan_selected_arm_fixed_ee_z(
+                                stage="retreat",
+                                arm=selected_arm,
+                                target_pose=retreat_pose,
+                                world_yml=object_world_yml,
+                                q_start_cspace=raise_plan.q_goal_cspace,
+                            )
+                        except FixedZRetreatIKError as exc:
+                            self.get_logger().warning(
+                                "[ARM_PICKING] retreat IK failed after post-grasp raise; "
+                                "publishing arm_picking_finish immediately: "
+                                f"arm={normalize_arm_name(selected_arm)} error={exc}"
+                            )
+                            self._publish_arm_picking_finish(
+                                selected_arm,
+                                stage="retreat_ik_failed",
+                            )
+                            return
                         self._wait_for_single_arm(stage="retreat", plan=retreat_plan)
 
                     self.get_logger().info(
@@ -2503,13 +2519,25 @@ class ArmPickingCoordinator(Node):
                 self._wait_for_single_arm(stage="lift", plan=lift_plan)
 
                 retreat_pose = _build_post_grasp_staging_pose(selected_arm, lift_pose)
-                retreat_plan = self._plan_selected_arm_fixed_ee_z(
-                    stage="retreat",
-                    arm=selected_arm,
-                    target_pose=retreat_pose,
-                    world_yml=object_world_yml,
-                    q_start_cspace=lift_plan.q_goal_cspace,
-                )
+                try:
+                    retreat_plan = self._plan_selected_arm_fixed_ee_z(
+                        stage="retreat",
+                        arm=selected_arm,
+                        target_pose=retreat_pose,
+                        world_yml=object_world_yml,
+                        q_start_cspace=lift_plan.q_goal_cspace,
+                    )
+                except FixedZRetreatIKError as exc:
+                    self.get_logger().warning(
+                        "[ARM_PICKING] retreat IK failed after post-grasp lift; "
+                        "publishing arm_picking_finish immediately: "
+                        f"arm={normalize_arm_name(selected_arm)} error={exc}"
+                    )
+                    self._publish_arm_picking_finish(
+                        selected_arm,
+                        stage="retreat_ik_failed",
+                    )
+                    return
                 self._wait_for_single_arm(stage="retreat", plan=retreat_plan)
 
                 self.get_logger().info(
