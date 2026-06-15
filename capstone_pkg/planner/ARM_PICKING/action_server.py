@@ -95,7 +95,7 @@ _SHELF_1_ALIGN_FIXED_X_M = 0.35
 _SHELF_1_ALIGN_FIXED_Y_M = 0.1
 _SHELF_1_ALIGN_FIXED_Z_M = 1.35
 _SHELF_2_COLLISION_X_OFFSET_FROM_ARUCO_M = -0.05
-_SHELF_2_COLLISION_MODEL_X_OFFSET_M = 0.22
+_SHELF_2_COLLISION_MODEL_X_OFFSET_M = 0.2
 _GRASP_OBJECT_POSE_X_OFFSET_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_X_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.015
@@ -109,6 +109,9 @@ _PREFERRED_GRASP_QUATERNION_XYZW = (
     0.7071067811865475,
     5.551115123125783e-17,
 )
+_SNACK_FALLBACK_Y_OFFSET_M = 0.07
+_SNACK_FALLBACK_Z_OFFSET_M = 0.03
+_SNACK_FALLBACK_YAW_OFFSET_RAD = -0.5 * math.pi
 _GRASP_IK_CANDIDATE_BATCH_SIZE = 3
 _GRASP_FALLBACK_Z_OFFSET_M = 0.03
 _GRASP_FALLBACK_X_OFFSET_M = -0.0
@@ -189,6 +192,25 @@ def _normalize_orientation(quat: Quaternion) -> Quaternion:
     return out
 
 
+def _quaternion_multiply_xyzw(
+    a_xyzw: Sequence[float],
+    b_xyzw: Sequence[float],
+) -> tuple[float, float, float, float]:
+    ax, ay, az, aw = (float(v) for v in a_xyzw[:4])
+    bx, by, bz, bw = (float(v) for v in b_xyzw[:4])
+    return (
+        (aw * bx) + (ax * bw) + (ay * bz) - (az * by),
+        (aw * by) - (ax * bz) + (ay * bw) + (az * bx),
+        (aw * bz) + (ax * by) - (ay * bx) + (az * bw),
+        (aw * bw) - (ax * bx) - (ay * by) - (az * bz),
+    )
+
+
+def _z_axis_rotation_quaternion_xyzw(angle_rad: float) -> tuple[float, float, float, float]:
+    half = 0.5 * float(angle_rad)
+    return (0.0, 0.0, math.sin(half), math.cos(half))
+
+
 def _build_align_target_pose(
     msg: ObjectAlign,
     *,
@@ -244,6 +266,22 @@ def _preferred_grasp_orientation() -> Quaternion:
             y=float(_PREFERRED_GRASP_QUATERNION_XYZW[1]),
             z=float(_PREFERRED_GRASP_QUATERNION_XYZW[2]),
             w=float(_PREFERRED_GRASP_QUATERNION_XYZW[3]),
+        )
+    )
+
+
+def _snack_fallback_grasp_orientation() -> Quaternion:
+    yaw_quat_xyzw = _z_axis_rotation_quaternion_xyzw(_SNACK_FALLBACK_YAW_OFFSET_RAD)
+    rotated_xyzw = _quaternion_multiply_xyzw(
+        yaw_quat_xyzw,
+        _PREFERRED_GRASP_QUATERNION_XYZW,
+    )
+    return _normalize_orientation(
+        Quaternion(
+            x=float(rotated_xyzw[0]),
+            y=float(rotated_xyzw[1]),
+            z=float(rotated_xyzw[2]),
+            w=float(rotated_xyzw[3]),
         )
     )
 
@@ -335,14 +373,48 @@ def _build_object_center_fallback_pose(
     msg: ObjectGrasp,
     *,
     x_offset_m: float = 0.0,
+    y_offset_m: float = 0.0,
     z_offset_m: float = 0.0,
+    orientation: Quaternion | None = None,
 ) -> Pose:
     pose = Pose()
     pose.position = _copy_point(msg.object_pose.position)
     pose.position.x = float(pose.position.x) + float(x_offset_m)
+    pose.position.y = float(pose.position.y) + float(y_offset_m)
     pose.position.z = float(pose.position.z) + float(z_offset_m)
-    pose.orientation = _preferred_grasp_orientation()
+    pose.orientation = (
+        _preferred_grasp_orientation()
+        if orientation is None
+        else _normalize_orientation(orientation)
+    )
     return pose
+
+
+def _snack_fallback_y_offset_m(arm: str) -> float:
+    return (
+        float(_SNACK_FALLBACK_Y_OFFSET_M)
+        if normalize_arm_name(arm) == "left"
+        else -float(_SNACK_FALLBACK_Y_OFFSET_M)
+    )
+
+
+def _build_snack_object_center_fallback_pose(
+    msg: ObjectGrasp,
+    *,
+    arm: str,
+) -> Pose:
+    return _build_object_center_fallback_pose(
+        msg,
+        y_offset_m=_snack_fallback_y_offset_m(arm),
+        z_offset_m=float(_SNACK_FALLBACK_Z_OFFSET_M),
+        orientation=_snack_fallback_grasp_orientation(),
+    )
+
+
+def _is_snack_grasp_msg(msg: ObjectGrasp) -> bool:
+    label = str(getattr(msg, "label", "")).strip()
+    label_lower = label.lower()
+    return "과자" in label or label_lower in {"snack", "snacks"}
 
 
 def _offset_pose_z(base_pose: Pose, delta_z_m: float) -> Pose:
@@ -1263,30 +1335,55 @@ class ArmPickingCoordinator(Node):
                 "[GRASP IK] no grasp candidates in message; falling back to object center pose."
             )
 
-        fallback_attempts = (
-            (
-                f"object_center_z_plus_{_GRASP_FALLBACK_Z_OFFSET_M:.3f}",
-                _build_object_center_fallback_pose(
-                    grasp_msg,
-                    z_offset_m=float(_GRASP_FALLBACK_Z_OFFSET_M),
+        fallback_attempts: list[tuple[str, Pose]] = []
+        if _is_snack_grasp_msg(grasp_msg):
+            snack_y_offset_m = _snack_fallback_y_offset_m(arm)
+            snack_y_direction = "plus" if snack_y_offset_m >= 0.0 else "minus"
+            fallback_attempts.append(
+                (
+                    f"snack_object_center_y_{snack_y_direction}_"
+                    f"{abs(snack_y_offset_m):.3f}_z_plus_"
+                    f"{_SNACK_FALLBACK_Z_OFFSET_M:.3f}_yaw_minus_90deg",
+                    _build_snack_object_center_fallback_pose(
+                        grasp_msg,
+                        arm=arm,
+                    ),
+                )
+            )
+            self.get_logger().info(
+                "[GRASP IK] snack fallback enabled after grasp candidate failure: "
+                f"arm={normalize_arm_name(arm)} "
+                f"y_offset_m={snack_y_offset_m:.3f} "
+                f"z_offset_m={_SNACK_FALLBACK_Z_OFFSET_M:.3f} "
+                f"yaw_offset_deg={math.degrees(_SNACK_FALLBACK_YAW_OFFSET_RAD):.1f}"
+            )
+
+        fallback_attempts.extend(
+            [
+                (
+                    f"object_center_z_plus_{_GRASP_FALLBACK_Z_OFFSET_M:.3f}",
+                    _build_object_center_fallback_pose(
+                        grasp_msg,
+                        z_offset_m=float(_GRASP_FALLBACK_Z_OFFSET_M),
+                    ),
                 ),
-            ),
-            (
-                f"object_center_x_minus_{abs(_GRASP_FALLBACK_X_OFFSET_M):.3f}",
-                _build_object_center_fallback_pose(
-                    grasp_msg,
-                    x_offset_m=float(_GRASP_FALLBACK_X_OFFSET_M),
+                (
+                    f"object_center_x_minus_{abs(_GRASP_FALLBACK_X_OFFSET_M):.3f}",
+                    _build_object_center_fallback_pose(
+                        grasp_msg,
+                        x_offset_m=float(_GRASP_FALLBACK_X_OFFSET_M),
+                    ),
                 ),
-            ),
-            (
-                "object_center_z_plus_"
-                f"{_GRASP_FALLBACK_Z_OFFSET_M:.3f}_x_minus_{abs(_GRASP_FALLBACK_X_OFFSET_M):.3f}",
-                _build_object_center_fallback_pose(
-                    grasp_msg,
-                    x_offset_m=float(_GRASP_FALLBACK_X_OFFSET_M),
-                    z_offset_m=float(_GRASP_FALLBACK_Z_OFFSET_M),
+                (
+                    "object_center_z_plus_"
+                    f"{_GRASP_FALLBACK_Z_OFFSET_M:.3f}_x_minus_{abs(_GRASP_FALLBACK_X_OFFSET_M):.3f}",
+                    _build_object_center_fallback_pose(
+                        grasp_msg,
+                        x_offset_m=float(_GRASP_FALLBACK_X_OFFSET_M),
+                        z_offset_m=float(_GRASP_FALLBACK_Z_OFFSET_M),
+                    ),
                 ),
-            ),
+            ]
         )
         for source, pose in fallback_attempts:
             selection, solve_call_count, success_count, candidate_success_count = self._select_best_grasp_ik(
@@ -1300,7 +1397,8 @@ class ArmPickingCoordinator(Node):
                 "[GRASP IK] fallback attempt: "
                 f"source={source} solve_calls={solve_call_count} "
                 f"raw_successes={success_count} candidate_successes={candidate_success_count} "
-                f"target_xyz={_pose_position_xyz(pose)}"
+                f"target_xyz={_pose_position_xyz(pose)} "
+                f"target_quat_xyzw={_pose_orientation_xyzw(pose)}"
             )
             if selection is not None:
                 self.get_logger().info(
