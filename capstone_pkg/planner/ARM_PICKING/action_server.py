@@ -93,7 +93,9 @@ _LEFT_SHELF_2_ALIGN_QUATERNION_XYZW = (
 )
 _SHELF_1_ALIGN_FIXED_X_M = 0.35
 _SHELF_1_ALIGN_FIXED_Y_M = 0.1
-_SHELF_1_ALIGN_FIXED_Z_M = 1.2
+_SHELF_1_ALIGN_FIXED_Z_M = 1.35
+_SHELF_2_COLLISION_X_OFFSET_FROM_ARUCO_M = -0.05
+_SHELF_2_COLLISION_MODEL_X_OFFSET_M = 0.22
 _GRASP_OBJECT_POSE_X_OFFSET_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_X_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.015
@@ -271,6 +273,62 @@ def _make_doorless_fridge_world_yml(source_world_yml: str = DOOR_COLLISION_YAML)
     with open(tmp_path, "w", encoding="utf-8") as f:
         yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
     return str(tmp_path)
+
+
+def _make_shelf_2_aruco_x_aligned_world_yml(
+    source_world_yml: str,
+    *,
+    aruco_x_m: float,
+) -> tuple[str, float, float]:
+    import yaml
+
+    with open(str(source_world_yml), "r", encoding="utf-8") as f:
+        loaded = yaml.safe_load(f)
+    raw = loaded if isinstance(loaded, dict) else {}
+    cuboids = raw.get("cuboid", {})
+    if not isinstance(cuboids, dict):
+        raise RuntimeError(f"shelf_2 collision yaml cuboid entry must be a mapping: {source_world_yml}")
+
+    reference_x: float | None = None
+    for name, item in cuboids.items():
+        if not isinstance(item, dict):
+            raise RuntimeError(f"shelf_2 cuboid '{name}' must be a mapping")
+        pose = item.get("pose")
+        if not isinstance(pose, (list, tuple)) or len(pose) != 7:
+            raise RuntimeError(f"shelf_2 cuboid '{name}' pose must be length 7")
+        pose_x = float(pose[0])
+        reference_x = pose_x if reference_x is None else min(reference_x, pose_x)
+    if reference_x is None:
+        raise RuntimeError(f"shelf_2 collision yaml has no cuboids: {source_world_yml}")
+
+    target_x = (
+        float(aruco_x_m)
+        + float(_SHELF_2_COLLISION_X_OFFSET_FROM_ARUCO_M)
+        + float(_SHELF_2_COLLISION_MODEL_X_OFFSET_M)
+    )
+    delta_x = target_x - float(reference_x)
+    for item in cuboids.values():
+        pose = item["pose"]
+        item["pose"] = [
+            float(pose[0]) + delta_x,
+            float(pose[1]),
+            float(pose[2]),
+            float(pose[3]),
+            float(pose[4]),
+            float(pose[5]),
+            float(pose[6]),
+        ]
+
+    tmp = tempfile.NamedTemporaryFile(
+        prefix="arm_picking_shelf_2_aruco_world_",
+        suffix=".yaml",
+        delete=False,
+    )
+    tmp_path = Path(tmp.name)
+    tmp.close()
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
+    return str(tmp_path), target_x, delta_x
 
 
 def _build_object_center_fallback_pose(
@@ -2400,6 +2458,21 @@ class ArmPickingCoordinator(Node):
                     shelf_type=sequence_shelf_type,
                 )
             )
+            if not shelf_1_single_left_align and sequence_shelf_type == "shelf_2":
+                shifted_world_yml, target_collision_x, collision_delta_x = (
+                    _make_shelf_2_aruco_x_aligned_world_yml(
+                        str(world_yml),
+                        aruco_x_m=float(msg.marker_position.x),
+                    )
+                )
+                world_yml = shifted_world_yml
+                self.get_logger().info(
+                    "[ARM_PICKING] shelf_2 collision model aligned to ArUco x: "
+                    f"aruco_x={float(msg.marker_position.x):.3f} "
+                    f"target_x={target_collision_x:.3f} "
+                    f"delta_x={collision_delta_x:.3f} "
+                    f"world_yml={world_yml}"
+                )
             target_pose = _build_align_target_pose(
                 msg,
                 selected_arm=selected_arm,

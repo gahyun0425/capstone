@@ -242,7 +242,7 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--door_open_ik_max_rot_deg",
         type=float,
-        default=6.0,
+        default=15.0,
         help="reject opening IK candidates whose FK orientation error exceeds this value",
     )
     ap.add_argument(
@@ -343,8 +343,8 @@ def _build_arm_door_parser():
     ap.add_argument("--door_open_graph_reach_z_min_m", type=float, default=0.65)
     ap.add_argument("--door_open_graph_reach_z_max_m", type=float, default=1.35)
     ap.add_argument("--door_open_graph_reach_nominal_m", type=float, default=0.55)
-    ap.add_argument("--door_open_front_goal_x", type=float, default=0.10)
-    ap.add_argument("--door_open_front_goal_y", type=float, default=0.0)
+    ap.add_argument("--door_open_front_goal_x", type=float, default=None)
+    ap.add_argument("--door_open_front_goal_y", type=float, default=None)
     ap.add_argument("--door_open_front_goal_yaw_deg", type=float, default=0.0)
     ap.add_argument("--door_open_front_goal_tol_m", type=float, default=0.02)
     ap.add_argument(
@@ -356,14 +356,14 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--door_open_front_goal_y_tol_m",
         type=float,
-        default=0.30,
-        help="y tolerance for the post-opening base goal, allowing the base to avoid the open door",
+        default=0.06,
+        help="y tolerance for the post-opening base goal while keeping the base on the shifted traversal line",
     )
-    ap.add_argument("--door_open_front_goal_tol_deg", type=float, default=15.0)
+    ap.add_argument("--door_open_front_goal_tol_deg", type=float, default=20.0)
     ap.add_argument(
         "--door_open_front_detour",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="split the final forward move into an open-door detour while keeping the handle grasped",
     )
     ap.add_argument(
@@ -376,7 +376,7 @@ def _build_arm_door_parser():
         "--door_open_front_detour_y_backoff_m",
         type=float,
         default=0.05,
-        help="keep the automatic traversal detour this far inside the y tolerance boundary",
+        help="legacy option retained for CLI compatibility; automatic traversal now targets --door_open_front_goal_y",
     )
     ap.add_argument("--door_open_front_detour_y_steps", type=int, default=4)
     ap.add_argument(
@@ -409,6 +409,52 @@ def _build_arm_door_parser():
         type=int,
         default=8,
         help="number of appended base-only publish samples after opening",
+    )
+    ap.add_argument(
+        "--post_open_release_ingress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="after opening the door, release the handle, retreat the right gripper, zero the right arm, then drive the base inward",
+    )
+    ap.add_argument(
+        "--post_open_retreat_z_m",
+        type=float,
+        default=0.05,
+        help="right-gripper local +Z retreat distance after releasing the door handle",
+    )
+    ap.add_argument("--post_open_retreat_steps", type=int, default=5)
+    ap.add_argument("--post_open_release_wait_s", type=float, default=0.3)
+    ap.add_argument("--post_open_retreat_wait_s", type=float, default=0.0)
+    ap.add_argument("--post_open_zero_wait_s", type=float, default=0.0)
+    ap.add_argument(
+        "--post_open_lateral_distance_m",
+        type=float,
+        default=0.15,
+        help="base body-y distance to move after the right arm is zeroed and before ingress",
+    )
+    ap.add_argument(
+        "--post_open_lateral_speed_mps",
+        type=float,
+        default=0.10,
+        help="base body-y speed for the post-open lateral move before ingress",
+    )
+    ap.add_argument(
+        "--post_open_ingress_distance_m",
+        type=float,
+        default=0.40,
+        help="base body-x distance to drive inward after the right arm is zeroed",
+    )
+    ap.add_argument(
+        "--post_open_ingress_yaw_deg",
+        type=float,
+        default=-20.0,
+        help="base yaw delta to apply during the post-open inward drive",
+    )
+    ap.add_argument(
+        "--post_open_ingress_speed_mps",
+        type=float,
+        default=0.10,
+        help="base body-x speed for the post-open inward drive",
     )
     ap.add_argument(
         "--door_open_base_publish_interp",
@@ -577,7 +623,7 @@ def _build_arm_door_parser():
         help="optional JSON path for per-waypoint opening FK validation",
     )
     ap.add_argument("--opening_fk_warn_pos_m", type=float, default=0.02)
-    ap.add_argument("--opening_fk_warn_rot_deg", type=float, default=6.0)
+    ap.add_argument("--opening_fk_warn_rot_deg", type=float, default=15.0)
     ap.add_argument(
         "--opening_fk_fail_on_warn",
         action=argparse.BooleanOptionalAction,
@@ -633,12 +679,13 @@ def _build_arm_door_parser():
     return ap
 
 
-def _publish_real_path(args, arm: str, joint_names, path) -> None:
+def _publish_real_path(args, arm: str, joint_names, path, *, dt_override: float | None = None) -> None:
     from capstone_pkg.planner.arm_rrt_common.path_publisher import (
         publish_joint_trajectory,
         send_joint_trajectory_action,
     )
 
+    dt = float(args.publish_dt) if dt_override is None else float(dt_override)
     topic = args.real_left_topic if arm == "left" else args.real_right_topic
     action_name = args.real_left_action if arm == "left" else args.real_right_action
 
@@ -649,7 +696,7 @@ def _publish_real_path(args, arm: str, joint_names, path) -> None:
                 path,
                 joint_names,
                 action_name=action_name,
-                dt=args.publish_dt,
+                dt=dt,
                 wait_server_s=args.action_wait_server_s,
                 wait_result_s=args.action_wait_result_s,
             )
@@ -664,7 +711,7 @@ def _publish_real_path(args, arm: str, joint_names, path) -> None:
         path,
         joint_names,
         topic=topic,
-        dt=args.publish_dt,
+        dt=dt,
         wait_subscriber_s=args.publish_wait_subscriber_s,
         require_subscriber=args.publish_require_subscriber,
         retry_until_subscriber=args.publish_retry_until_subscriber,
@@ -935,7 +982,7 @@ def _plan_and_publish_right_arm_zero(
     start_cspace_joint_names: Sequence[str] | None = None,
     fallback_start_q_cspace: Sequence[float] | None = None,
     world_yml: str | None = None,
-) -> None:
+) -> float:
     from capstone_pkg.kinematics.curobo_ik import get_single_arm_ik
     from capstone_pkg.planner.arm_rrt_common.single_arm_motion import normalize_arm_name
     from capstone_pkg.planner.arm_rrt_common.single_arm_runner import build_single_arm_tbrrt_config
@@ -997,9 +1044,10 @@ def _plan_and_publish_right_arm_zero(
         "[ARM_DOOR][RIGHT_ARM_ZERO] planned "
         f"waypoints={len(active_path)} planning_time={planning_time_s:.3f}s"
     )
+    publish_duration_s = max(0.0, float(len(active_path) - 1) * float(args.publish_dt))
     if args.publish_mode == "real":
         _publish_real_path(args, "right", joint_names, active_path)
-        return
+        return publish_duration_s
 
     from capstone_pkg.planner.arm_rrt_common.path_publisher import publish_joint_path
 
@@ -1013,6 +1061,243 @@ def _plan_and_publish_right_arm_zero(
         topic=str(args.publish_topic),
         dt=max(0.1, float(args.publish_dt)),
         wait_subscriber_s=float(args.publish_wait_subscriber_s),
+    )
+    return publish_duration_s
+
+
+def _plan_and_publish_right_gripper_local_z_retreat(
+    args,
+    *,
+    start_cspace_joint_names: Sequence[str],
+    start_q_cspace: Sequence[float],
+    retreat_z_m: float,
+) -> tuple[list[str], list[float], float]:
+    from capstone_pkg.kinematics.curobo_ik import get_single_arm_ik
+    from capstone_pkg.planner.arm_rrt_common.single_arm_motion import _build_ik_seed_batch
+    from capstone_pkg.utils.joint_limit import load_joint_limits_torch
+    import numpy as np
+    import torch
+
+    cspace_joint_names = [str(name) for name in start_cspace_joint_names]
+    q_start = [float(v) for v in start_q_cspace]
+    if len(cspace_joint_names) != len(q_start):
+        raise RuntimeError("post-open retreat cspace names and q length mismatch")
+
+    ik = get_single_arm_ik(
+        str(args.robot_yml),
+        arm="right",
+        cpu=bool(args.cpu),
+        world_yml=None,
+        use_cuda_graph=False,
+    )
+    q_active = _extract_active_from_cspace(
+        q_start,
+        cspace_joint_names,
+        ik.active_joint_names,
+    )
+    with torch.no_grad():
+        kin = ik.solver.fk(
+            torch.tensor([q_active], device=ik.device, dtype=torch.float32)
+        )
+    ee_xyz = [float(v) for v in kin.ee_position[0].detach().cpu().tolist()]
+    ee_quat_wxyz = [float(v) for v in kin.ee_quaternion[0].detach().cpu().tolist()]
+    local_z_base = _quat_rotate_wxyz(ee_quat_wxyz, [0.0, 0.0, 1.0])
+    target_xyz = [
+        ee_xyz[i] + float(retreat_z_m) * local_z_base[i]
+        for i in range(3)
+    ]
+
+    jl = load_joint_limits_torch(
+        str(args.joint_limit_yml),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    seed_batch = _build_ik_seed_batch(
+        q_start,
+        batch_size=max(1, int(getattr(args, "door_open_ik_batch", 8))),
+        noise_std=max(0.0, float(getattr(args, "door_open_ik_seed_noise_std", 0.20))),
+        random_seed=int(getattr(args, "door_open_ik_seed", 11)) + 50021,
+        lower=jl.lower.detach().cpu().numpy(),
+        upper=jl.upper.detach().cpu().numpy(),
+    )
+    outs = ik.solve_batch(
+        [list(target_xyz) for _ in seed_batch],
+        [list(ee_quat_wxyz) for _ in seed_batch],
+        q_start_cspace=q_start,
+        q_seed_cspace_batch=seed_batch,
+    )
+    candidates = [out.q_cspace for out in outs if out.success and out.q_cspace is not None]
+    if not candidates:
+        raise RuntimeError(
+            "failed to solve post-open gripper local +Z retreat IK: "
+            f"start_xyz={[round(v, 4) for v in ee_xyz]} "
+            f"target_xyz={[round(v, 4) for v in target_xyz]}"
+        )
+    q_goal = min(
+        ([float(v) for v in q] for q in candidates),
+        key=lambda q: float(np.linalg.norm(np.asarray(q) - np.asarray(q_start))),
+    )
+
+    steps = max(1, int(getattr(args, "post_open_retreat_steps", 5)))
+    cspace_path = []
+    for idx in range(steps + 1):
+        t = float(idx) / float(steps)
+        cspace_path.append([
+            q_start[j] + (q_goal[j] - q_start[j]) * t
+            for j in range(len(q_start))
+        ])
+    joint_names, active_path = _active_path_from_cspace(
+        cspace_joint_names,
+        ik.controlled_joint_names,
+        cspace_path,
+    )
+    dt = max(0.1, float(args.publish_dt))
+    duration_s = max(0.0, float(len(active_path) - 1) * dt)
+    print(
+        "[ARM_DOOR][POST_OPEN][RETREAT] "
+        f"right gripper local +Z {float(retreat_z_m):.3f}m "
+        f"target_xyz={[round(v, 4) for v in target_xyz]} "
+        f"waypoints={len(active_path)}"
+    )
+    if args.publish_mode == "real":
+        _publish_real_path(args, "right", joint_names, active_path, dt_override=dt)
+    else:
+        from capstone_pkg.planner.arm_rrt_common.path_publisher import publish_joint_path
+
+        publish_joint_path(
+            active_path,
+            joint_names,
+            topic=str(args.publish_topic),
+            dt=dt,
+            wait_subscriber_s=float(args.publish_wait_subscriber_s),
+        )
+    return cspace_joint_names, q_goal, duration_s
+
+
+def _publish_base_body_move(
+    args,
+    *,
+    axis: str,
+    distance_m: float,
+    speed_mps: float,
+    label: str,
+    yaw_delta_deg: float = 0.0,
+) -> None:
+    axis = str(axis).lower()
+    if axis not in {"x", "y"}:
+        raise RuntimeError(f"unsupported base body move axis: {axis}")
+
+    owns_rclpy = False
+    if not rclpy.ok():
+        rclpy.init()
+        owns_rclpy = True
+
+    node = Node(f"arm_door_{label}_base_move")
+    pub = node.create_publisher(Twist, str(args.real_base_cmd_vel_topic), 10)
+    wait_deadline = time.monotonic() + max(0.0, float(args.publish_wait_subscriber_s))
+    while rclpy.ok() and pub.get_subscription_count() == 0 and time.monotonic() < wait_deadline:
+        rclpy.spin_once(node, timeout_sec=0.05)
+
+    distance = float(distance_m)
+    max_linear = max(1.0e-3, abs(float(args.real_base_max_linear_mps)))
+    speed = min(max_linear, max(1.0e-3, abs(float(speed_mps))))
+    signed_speed = math.copysign(speed, distance)
+    duration_s = abs(distance) / speed if abs(distance) > 1.0e-9 else 0.0
+    yaw_delta_rad = math.radians(float(yaw_delta_deg))
+    max_angular = max(1.0e-3, abs(float(args.real_base_max_angular_rps)))
+    angular_z = 0.0 if duration_s <= 1.0e-9 else max(-max_angular, min(max_angular, yaw_delta_rad / duration_s))
+    cmd_period_s = 1.0 / max(1.0, float(args.real_base_cmd_rate_hz))
+    print(
+        f"[ARM_DOOR][POST_OPEN][BASE] {label}: "
+        f"body_{axis}={distance:+.3f}m speed={signed_speed:+.3f}m/s "
+        f"yaw_delta={math.degrees(angular_z * duration_s):+.1f}deg "
+        f"topic={args.real_base_cmd_vel_topic}"
+    )
+
+    msg = Twist()
+    if axis == "x":
+        msg.linear.x = float(signed_speed)
+    else:
+        msg.linear.y = float(signed_speed)
+    msg.angular.z = float(angular_z)
+    end_time = time.monotonic() + duration_s
+    while rclpy.ok() and time.monotonic() < end_time:
+        pub.publish(msg)
+        rclpy.spin_once(node, timeout_sec=0.0)
+        remaining = end_time - time.monotonic()
+        if remaining > 0.0:
+            time.sleep(min(cmd_period_s, remaining))
+
+    stop_msg = Twist()
+    stop_end = time.monotonic() + max(0.0, float(args.real_base_stop_duration_s))
+    while rclpy.ok() and time.monotonic() < stop_end:
+        pub.publish(stop_msg)
+        rclpy.spin_once(node, timeout_sec=0.0)
+        time.sleep(min(0.05, max(0.001, cmd_period_s)))
+
+    node.destroy_node()
+    if owns_rclpy:
+        rclpy.shutdown()
+
+
+def _run_post_open_release_retreat_zero_ingress(
+    args,
+    *,
+    cspace_joint_names: Sequence[str],
+    q_cspace_end: Sequence[float],
+) -> None:
+    if not bool(getattr(args, "post_open_release_ingress", True)):
+        return
+
+    print("[ARM_DOOR][POST_OPEN] release handle, retreat gripper, zero right arm, ingress base")
+    _publish_gripper_open(args, "right")
+    release_wait_s = max(0.0, float(getattr(args, "post_open_release_wait_s", 0.3)))
+    if release_wait_s > 0.0:
+        time.sleep(release_wait_s)
+
+    retreat_names, retreat_q_end, retreat_duration_s = _plan_and_publish_right_gripper_local_z_retreat(
+        args,
+        start_cspace_joint_names=cspace_joint_names,
+        start_q_cspace=q_cspace_end,
+        retreat_z_m=float(getattr(args, "post_open_retreat_z_m", 0.05)),
+    )
+    retreat_wait_s = max(
+        retreat_duration_s,
+        max(0.0, float(getattr(args, "post_open_retreat_wait_s", 0.0))),
+    )
+    if retreat_wait_s > 0.0:
+        print(f"[ARM_DOOR][POST_OPEN][RETREAT] waiting {retreat_wait_s:.2f}s")
+        time.sleep(retreat_wait_s)
+
+    zero_duration_s = _plan_and_publish_right_arm_zero(
+        args,
+        start_cspace_joint_names=retreat_names,
+        fallback_start_q_cspace=retreat_q_end,
+        world_yml=None,
+    )
+    zero_wait_s = max(
+        zero_duration_s,
+        max(0.0, float(getattr(args, "post_open_zero_wait_s", 0.0))),
+    )
+    if zero_wait_s > 0.0:
+        print(f"[ARM_DOOR][POST_OPEN][ZERO] waiting {zero_wait_s:.2f}s")
+        time.sleep(zero_wait_s)
+
+    _publish_base_body_move(
+        args,
+        axis="y",
+        distance_m=float(getattr(args, "post_open_lateral_distance_m", 0.15)),
+        speed_mps=float(getattr(args, "post_open_lateral_speed_mps", 0.10)),
+        label="lateral",
+    )
+
+    _publish_base_body_move(
+        args,
+        axis="x",
+        distance_m=float(getattr(args, "post_open_ingress_distance_m", 0.40)),
+        speed_mps=float(getattr(args, "post_open_ingress_speed_mps", 0.10)),
+        label="ingress",
+        yaw_delta_deg=float(getattr(args, "post_open_ingress_yaw_deg", -20.0)),
     )
 
 
@@ -1959,12 +2244,84 @@ def _quat_angle_error_rad(a_wxyz: Sequence[float], b_wxyz: Sequence[float]) -> f
     return 2.0 * math.acos(dot)
 
 
+def _pack_cuboids_for_sphere_check(
+    cuboids: Mapping[str, Any],
+    *,
+    device,
+    dtype=None,
+) -> tuple[list[str], Any, Any, Any] | None:
+    import torch
+
+    names: list[str] = []
+    centers: list[list[float]] = []
+    halves: list[list[float]] = []
+    rotations: list[list[list[float]]] = []
+    for name, cuboid in cuboids.items():
+        if not isinstance(cuboid, Mapping):
+            continue
+        dims = cuboid.get("dims")
+        pose = cuboid.get("pose")
+        if not isinstance(dims, (list, tuple)) or len(dims) != 3:
+            raise RuntimeError(f"cuboid dims must be length 3: {dims}")
+        if not isinstance(pose, (list, tuple)) or len(pose) != 7:
+            raise RuntimeError(f"cuboid pose must be length 7: {pose}")
+        names.append(str(name))
+        centers.append([float(v) for v in pose[:3]])
+        halves.append([0.5 * float(v) for v in dims])
+        rotations.append(_quat_wxyz_to_rotmat(pose[3:7]))
+
+    if not names:
+        return None
+    tensor_dtype = dtype if dtype is not None else torch.float32
+    return (
+        names,
+        torch.tensor(centers, device=device, dtype=tensor_dtype),
+        torch.tensor(halves, device=device, dtype=tensor_dtype),
+        torch.tensor(rotations, device=device, dtype=tensor_dtype),
+    )
+
+
+def _cuboid_sphere_pack_max_violation(
+    spheres,
+    cuboid_pack: tuple[list[str], Any, Any, Any] | None,
+    *,
+    margin_m: float,
+) -> tuple[float, str]:
+    import torch
+
+    if cuboid_pack is None:
+        return 0.0, ""
+
+    names, centers, halves, rotations = cuboid_pack
+    if len(names) <= 0:
+        return 0.0, ""
+
+    sphere_xyz = spheres[:, :3]
+    sphere_r = spheres[:, 3]
+    rel = sphere_xyz.unsqueeze(0) - centers.unsqueeze(1)
+    local = torch.matmul(rel, rotations)
+    q = torch.abs(local) - halves.unsqueeze(1)
+    outside = torch.clamp(q, min=0.0)
+    outside_dist = torch.linalg.norm(outside, dim=-1)
+    inside_dist = torch.clamp(torch.max(q, dim=-1).values, max=0.0)
+    signed_dist = outside_dist + inside_dist
+    violation = sphere_r.unsqueeze(0) + float(margin_m) - signed_dist
+    per_cuboid = torch.max(violation, dim=1).values
+    max_violation, max_idx = torch.max(per_cuboid, dim=0)
+    return (
+        float(max_violation.detach().cpu().item()),
+        names[int(max_idx.detach().cpu().item())],
+    )
+
+
 def _opening_candidate_collision(
     *,
     checker,
     q_cspace: Sequence[float],
     base_pose: Sequence[float],
     cuboids: Mapping[str, Any],
+    cuboid_sphere_pack=None,
+    cuboid_sphere_packs: Sequence[Any] | None = None,
     margin_m: float,
     device,
 ) -> tuple[float, float, str]:
@@ -1986,20 +2343,29 @@ def _opening_candidate_collision(
         raise RuntimeError(f"Unexpected sphere tensor shape: {tuple(x_sph.shape)}")
 
     spheres[:, :3] = _transform_points_by_base_pose(spheres[:, :3], base_pose)
+    if cuboid_sphere_packs is not None:
+        packs = list(cuboid_sphere_packs)
+    elif cuboid_sphere_pack is not None:
+        packs = [cuboid_sphere_pack]
+    else:
+        cuboid_sphere_pack = _pack_cuboids_for_sphere_check(
+            cuboids,
+            device=device,
+            dtype=spheres.dtype,
+        )
+        packs = [cuboid_sphere_pack]
+
     world_violation = -float("inf")
     obstacle = ""
-    for name, cuboid in cuboids.items():
-        if not isinstance(cuboid, dict):
-            continue
-        violation = _cuboid_sphere_max_violation(
+    for pack in packs:
+        violation, pack_obstacle = _cuboid_sphere_pack_max_violation(
             spheres,
-            cuboid,
+            pack,
             margin_m=margin_m,
-            device=device,
         )
         if violation > world_violation:
-            world_violation = violation
-            obstacle = str(name)
+            world_violation = float(violation)
+            obstacle = str(pack_obstacle)
     if world_violation == -float("inf"):
         world_violation = 0.0
     return float(world_violation), float(self_pen), obstacle
@@ -2286,19 +2652,8 @@ def _build_door_opening_cspace_path(
             if opening_indices:
                 last_open_idx = opening_indices[-1]
                 start_base = [float(v) for v in graph_base_poses[last_open_idx]]
-                open_handle_xyz, _ = _door_handle_pose_at(
-                    alpha_rad=goal_alpha,
-                    closed_xyz=closed_handle_xyz,
-                    closed_quat_wxyz=closed_handle_quat_wxyz,
-                    door_hinge_xyz=door_hinge_xyz,
-                )
-                handle_side = -1.0 if float(open_handle_xyz[1]) <= front_goal_y else 1.0
                 if getattr(args, "door_open_front_detour_y", None) is None:
-                    detour_backoff = max(
-                        0.0,
-                        float(getattr(args, "door_open_front_detour_y_backoff_m", 0.05)),
-                    )
-                    detour_y = front_goal_y + handle_side * max(0.0, front_goal_y_tol - detour_backoff)
+                    detour_y = front_goal_y
                 else:
                     detour_y = float(args.door_open_front_detour_y)
                 detour_y = max(front_goal_y - front_goal_y_tol, min(front_goal_y + front_goal_y_tol, detour_y))
@@ -2310,21 +2665,9 @@ def _build_door_opening_cspace_path(
                 y_target = [start_base[0], detour_y, start_base[2]]
                 for step_idx in range(1, y_steps + 1):
                     front_waypoints.append(_interp_base_pose(start_base, y_target, step_idx / float(y_steps)))
-                traversal_y = max(
-                    front_goal_y - front_goal_y_tol,
-                    min(front_goal_y + front_goal_y_tol, start_base[1]),
-                )
-                forward_y_offset = min(
-                    front_goal_y_tol,
-                    max(abs(float(start_base[1]) - front_goal_y), 0.60 * front_goal_y_tol),
-                )
-                forward_y = max(
-                    front_goal_y - front_goal_y_tol,
-                    min(front_goal_y + front_goal_y_tol, front_goal_y + handle_side * forward_y_offset),
-                )
-                forward_yaw = _wrap_pi(
-                    front_goal_yaw + handle_side * graph_cfg.front_goal_tol_yaw_rad
-                )
+                traversal_y = detour_y
+                forward_y = detour_y
+                forward_yaw = front_goal_yaw
                 clear_y_target = [start_base[0], traversal_y, start_base[2]]
                 for step_idx in range(1, clear_y_steps + 1):
                     front_waypoints.append(_interp_base_pose(y_target, clear_y_target, step_idx / float(clear_y_steps)))
@@ -2486,6 +2829,7 @@ def _build_door_opening_cspace_path(
                 grasp_ee_quat_wxyz,
             )
         collision_cuboid_samples: list[Mapping[str, Any]] = []
+        collision_sphere_packs: list[Any] = []
         if collision_checker is not None and collision_source_world is not None:
             for collision_alpha in _opening_collision_alpha_samples(args, float(alpha)):
                 dynamic_world = _make_opening_dynamic_world(
@@ -2498,6 +2842,13 @@ def _build_door_opening_cspace_path(
                 if not isinstance(cuboids, dict):
                     raise RuntimeError("dynamic world cuboid entry must be a mapping")
                 collision_cuboid_samples.append(cuboids)
+                collision_sphere_packs.append(
+                    _pack_cuboids_for_sphere_check(
+                        cuboids,
+                        device=collision_device,
+                        dtype=torch.float32,
+                    )
+                )
 
         base_graph_candidates = (
             _base_pose_graph_candidates_for_alpha(args, alpha_rad=float(alpha))
@@ -2514,6 +2865,7 @@ def _build_door_opening_cspace_path(
                 "ee_xyz": list(ee_xyz),
                 "ee_quat_wxyz": list(ee_quat_wxyz),
                 "collision_cuboid_samples": collision_cuboid_samples,
+                "collision_sphere_packs": collision_sphere_packs,
                 "base_graph_candidates": base_graph_candidates,
                 "fixed_base_pose": None if graph_base_poses is None else graph_base_poses[idx - 1],
                 "phase": None if graph_phases is None else graph_phases[idx - 1],
@@ -2708,6 +3060,7 @@ def _build_door_opening_cspace_path(
         ee_xyz = [float(v) for v in target["ee_xyz"]]
         ee_quat_wxyz = [float(v) for v in target["ee_quat_wxyz"]]
         collision_cuboid_samples = list(target["collision_cuboid_samples"])
+        collision_sphere_packs = list(target.get("collision_sphere_packs", []))
         raw_target_phase = target.get("phase", -1)
         target_phase = -1 if raw_target_phase is None else int(raw_target_phase)
         target_collision_margin_m = collision_margin_m
@@ -2793,19 +3146,28 @@ def _build_door_opening_cspace_path(
                     collision_free = True
                     if collision_cuboid_samples:
                         collision_checked += 1
-                        world_violation = -float("inf")
-                        self_pen = -float("inf")
+                        candidate_sphere_packs = collision_sphere_packs
+                        if not candidate_sphere_packs:
+                            candidate_sphere_packs = [
+                                _pack_cuboids_for_sphere_check(
+                                    cuboids,
+                                    device=collision_device,
+                                    dtype=torch.float32,
+                                )
+                                for cuboids in collision_cuboid_samples
+                            ]
+                        world_violation, self_pen, obstacle = _opening_candidate_collision(
+                            checker=collision_checker,
+                            q_cspace=q_cand,
+                            base_pose=base_pose,
+                            cuboids=collision_cuboid_samples[0],
+                            cuboid_sphere_packs=candidate_sphere_packs,
+                            margin_m=target_collision_margin_m,
+                            device=collision_device,
+                        )
                         base_clearance_violation = -float("inf")
-                        obstacle = ""
+                        base_obstacle = ""
                         for cuboids in collision_cuboid_samples:
-                            cand_world, cand_self, cand_obstacle = _opening_candidate_collision(
-                                checker=collision_checker,
-                                q_cspace=q_cand,
-                                base_pose=base_pose,
-                                cuboids=cuboids,
-                                margin_m=target_collision_margin_m,
-                                device=collision_device,
-                            )
                             cand_base_violation, cand_base_obstacle = _base_door_clearance_violation(
                                 base_pose=base_pose,
                                 cuboids=cuboids,
@@ -2814,14 +3176,11 @@ def _build_door_opening_cspace_path(
                                 base_height_m=float(args.door_open_graph_base_height_m),
                                 door_names=DOOR_BASE_CLEARANCE_COLLISION_NAMES,
                             )
-                            if max(cand_world, cand_self) > max(world_violation, self_pen):
-                                world_violation = float(cand_world)
-                                self_pen = float(cand_self)
-                                obstacle = str(cand_obstacle)
                             if cand_base_violation > base_clearance_violation:
                                 base_clearance_violation = float(cand_base_violation)
-                                if cand_base_violation > max(world_violation, self_pen):
-                                    obstacle = str(cand_base_obstacle)
+                                base_obstacle = str(cand_base_obstacle)
+                        if base_clearance_violation > max(world_violation, self_pen):
+                            obstacle = str(base_obstacle)
                         candidate["world_violation"] = float(world_violation)
                         candidate["self_penetration"] = float(self_pen)
                         candidate["base_clearance_violation"] = max(0.0, float(base_clearance_violation))
@@ -3305,29 +3664,17 @@ def _cuboid_sphere_max_violation(
     margin_m: float,
     device,
 ) -> float:
-    import torch
-
-    dims = cuboid.get("dims")
-    pose = cuboid.get("pose")
-    if not isinstance(dims, (list, tuple)) or len(dims) != 3:
-        raise RuntimeError(f"cuboid dims must be length 3: {dims}")
-    if not isinstance(pose, (list, tuple)) or len(pose) != 7:
-        raise RuntimeError(f"cuboid pose must be length 7: {pose}")
-
-    center = torch.tensor([float(v) for v in pose[:3]], device=device, dtype=torch.float32)
-    half = torch.tensor([0.5 * float(v) for v in dims], device=device, dtype=torch.float32)
-    rot = torch.tensor(_quat_wxyz_to_rotmat(pose[3:7]), device=device, dtype=torch.float32)
-
-    sphere_xyz = spheres[:, :3]
-    sphere_r = spheres[:, 3]
-    local = (sphere_xyz - center) @ rot
-    q = torch.abs(local) - half
-    outside = torch.clamp(q, min=0.0)
-    outside_dist = torch.linalg.norm(outside, dim=1)
-    inside_dist = torch.clamp(torch.max(q, dim=1).values, max=0.0)
-    signed_dist = outside_dist + inside_dist
-    violation = sphere_r + float(margin_m) - signed_dist
-    return float(torch.max(violation).detach().cpu().item())
+    pack = _pack_cuboids_for_sphere_check(
+        {"cuboid": cuboid},
+        device=device,
+        dtype=spheres.dtype,
+    )
+    violation, _ = _cuboid_sphere_pack_max_violation(
+        spheres,
+        pack,
+        margin_m=margin_m,
+    )
+    return float(violation)
 
 
 def _validate_opening_dynamic_collision(
@@ -3400,19 +3747,20 @@ def _validate_opening_dynamic_collision(
             if not isinstance(cuboids, dict):
                 raise RuntimeError("dynamic world cuboid entry must be a mapping")
 
-            for name, cuboid in cuboids.items():
-                if not isinstance(cuboid, dict):
-                    continue
-                violation = _cuboid_sphere_max_violation(
-                    spheres,
-                    cuboid,
-                    margin_m=margin_m,
-                    device=device,
-                )
-                if violation > waypoint_max_world:
-                    waypoint_max_world = violation
-                    waypoint_obstacle = str(name)
-                    worst_collision_alpha = float(collision_alpha)
+            cuboid_pack = _pack_cuboids_for_sphere_check(
+                cuboids,
+                device=device,
+                dtype=spheres.dtype,
+            )
+            violation, obstacle = _cuboid_sphere_pack_max_violation(
+                spheres,
+                cuboid_pack,
+                margin_m=margin_m,
+            )
+            if violation > waypoint_max_world:
+                waypoint_max_world = violation
+                waypoint_obstacle = str(obstacle)
+                worst_collision_alpha = float(collision_alpha)
 
         if waypoint_max_world == -float("inf"):
             waypoint_max_world = 0.0
@@ -4194,18 +4542,34 @@ def _run_arm_door_sequence(args: argparse.Namespace) -> int:
                 except RuntimeError as exc:
                     print(f"[ARM_DOOR][OPEN] {exc}")
                     return 1
-                args._door_close_plan = _build_reverse_door_close_plan(
-                    arm=arm,
-                    joint_names=open_joint_names,
-                    path=publish_open_path,
-                    door_alphas_rad=publish_open_alphas,
-                    base_poses=publish_open_base_poses,
-                    desired_ee_poses=open_desired_ee_poses,
-                    cspace_joint_names=open_cspace_names,
-                    cspace_path=open_cspace_path,
-                    world_yml=resolved_world_yml,
-                )
-                print("[ARM_DOOR][CLOSE] cached reverse opening path for post-picking door close")
+                try:
+                    _run_post_open_release_retreat_zero_ingress(
+                        args,
+                        cspace_joint_names=open_cspace_names,
+                        q_cspace_end=open_cspace_path[-1],
+                    )
+                except RuntimeError as exc:
+                    print(f"[ARM_DOOR][POST_OPEN][ERROR] {exc}")
+                    return 1
+                if bool(getattr(args, "post_open_release_ingress", True)):
+                    args._door_close_plan = None
+                    print(
+                        "[ARM_DOOR][CLOSE] skipped reverse opening cache "
+                        "because post-open release/ingress changes the robot state"
+                    )
+                else:
+                    args._door_close_plan = _build_reverse_door_close_plan(
+                        arm=arm,
+                        joint_names=open_joint_names,
+                        path=publish_open_path,
+                        door_alphas_rad=publish_open_alphas,
+                        base_poses=publish_open_base_poses,
+                        desired_ee_poses=open_desired_ee_poses,
+                        cspace_joint_names=open_cspace_names,
+                        cspace_path=open_cspace_path,
+                        world_yml=resolved_world_yml,
+                    )
+                    print("[ARM_DOOR][CLOSE] cached reverse opening path for post-picking door close")
                 print("[ARM_DOOR][OPEN] done.")
 
     if args.plot_path:
@@ -4445,7 +4809,10 @@ class ArmDoorSequenceNode(Node):
         try:
             result = self._process_align(msg)
             if result == 0:
-                self._waiting_one_step_finish = bool(self._args.post_one_step_door_close)
+                self._waiting_one_step_finish = (
+                    bool(self._args.post_one_step_door_close)
+                    and not bool(getattr(self._args, "post_open_release_ingress", True))
+                )
                 self._publish_finish()
                 if self._waiting_one_step_finish:
                     if self._door_close_plan is None:
