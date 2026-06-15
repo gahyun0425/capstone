@@ -98,7 +98,7 @@ _SHELF_2_COLLISION_X_OFFSET_FROM_ARUCO_M = -0.05
 _SHELF_2_COLLISION_MODEL_X_OFFSET_M = 0.2
 _GRASP_OBJECT_POSE_X_OFFSET_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_X_M = 0.01
-_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.015
+_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.03
 _SHELF_1_GRASP_COLLISION_OBJECT_SIZE_Z_OFFSET_M = 0.0
 _MIN_GRASP_COLLISION_OBJECT_SIZE_M = 0.001
 _SHELF_1_POST_GRASP_RAISE_Z_M = 0.30
@@ -109,9 +109,10 @@ _PREFERRED_GRASP_QUATERNION_XYZW = (
     0.7071067811865475,
     5.551115123125783e-17,
 )
-_SNACK_FALLBACK_Y_OFFSET_M = 0.03
-_SNACK_FALLBACK_Z_OFFSET_M = 0.03
+_SNACK_FALLBACK_Y_OFFSET_M = 0.02
+_SNACK_FALLBACK_Z_OFFSET_M = 0.02
 _SNACK_FALLBACK_YAW_OFFSET_RAD = -0.5 * math.pi
+_SNACK_COLLISION_OBJECT_SIZE_Y_M = 0.08
 _GRASP_IK_CANDIDATE_BATCH_SIZE = 3
 _GRASP_FALLBACK_Z_OFFSET_M = 0.03
 _GRASP_FALLBACK_X_OFFSET_M = -0.0
@@ -2407,6 +2408,8 @@ class ArmPickingCoordinator(Node):
                 object_size = _copy_vector3(grasp_msg.object_size)
                 object_size.x = float(_GRASP_COLLISION_OBJECT_SIZE_X_M)
                 object_size.y = float(object_size.y) - float(_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M)
+                if _is_snack_grasp_msg(grasp_msg):
+                    object_size.y = float(_SNACK_COLLISION_OBJECT_SIZE_Y_M)
                 if is_shelf_1:
                     object_size.z = max(
                         float(_MIN_GRASP_COLLISION_OBJECT_SIZE_M),
