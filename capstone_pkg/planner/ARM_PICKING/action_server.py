@@ -98,7 +98,7 @@ _SHELF_2_COLLISION_X_OFFSET_FROM_ARUCO_M = -0.05
 _SHELF_2_COLLISION_MODEL_X_OFFSET_M = 0.2
 _GRASP_OBJECT_POSE_X_OFFSET_M = 0.01
 _GRASP_COLLISION_OBJECT_SIZE_X_M = 0.01
-_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.03
+_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.01
 _SHELF_1_GRASP_COLLISION_OBJECT_SIZE_Z_OFFSET_M = 0.0
 _MIN_GRASP_COLLISION_OBJECT_SIZE_M = 0.001
 _SHELF_1_POST_GRASP_RAISE_Z_M = 0.30
@@ -116,6 +116,7 @@ _SNACK_COLLISION_OBJECT_SIZE_Y_M = 0.08
 _GRASP_IK_CANDIDATE_BATCH_SIZE = 3
 _GRASP_FALLBACK_Z_OFFSET_M = 0.03
 _GRASP_FALLBACK_X_OFFSET_M = -0.0
+_GRASP_FALLBACK_TRAJECTORY_DURATION_S = 3.0
 _ZERO_JOINT_TOL = 1.0e-4
 
 
@@ -422,6 +423,11 @@ def _is_snack_grasp_msg(msg: ObjectGrasp) -> bool:
     return "과자" in label or label_lower in {"snack", "snacks"}
 
 
+def _is_grasp_fallback_source(source: str) -> bool:
+    normalized = str(source).strip().lower()
+    return normalized.startswith("object_center") or normalized.startswith("snack_object_center")
+
+
 def _offset_pose_z(base_pose: Pose, delta_z_m: float) -> Pose:
     pose = _copy_pose(base_pose)
     pose.position.z = float(pose.position.z) + float(delta_z_m)
@@ -566,6 +572,19 @@ def _resolve_arrival_wait_s(
         return float(configured_wait_s)
     traj_duration_s = max(0.0, float(max(0, path_len - 1)) * float(dt))
     return max(2.0, traj_duration_s + 2.0)
+
+
+def _resolve_dt_for_trajectory_duration(
+    *,
+    path_len: int,
+    duration_s: float | None,
+    default_dt: float,
+) -> float:
+    if duration_s is None or float(duration_s) <= 0.0:
+        return float(default_dt)
+    if int(path_len) <= 1:
+        return float(duration_s)
+    return float(duration_s) / float(max(1, int(path_len) - 1))
 
 
 def _wrapped_joint_delta(a: float, b: float) -> float:
@@ -1875,7 +1894,9 @@ class ArmPickingCoordinator(Node):
         arm: str,
         joint_names: Sequence[str],
         joint_path: Sequence[Sequence[float]],
+        publish_dt: float | None = None,
     ) -> None:
+        dt = float(self._args.publish_dt if publish_dt is None else publish_dt)
         if self._args.publish_mode == "real":
             if bool(self._args.real_use_action):
                 command = JointTrajectoryCommand(
@@ -1891,7 +1912,7 @@ class ArmPickingCoordinator(Node):
                 try:
                     send_joint_trajectory_action_group(
                         [command],
-                        dt=float(self._args.publish_dt),
+                        dt=dt,
                         wait_server_s=float(self._args.action_wait_server_s),
                         wait_result_s=float(self._args.action_wait_result_s),
                         start_time_delay_s=float(getattr(self._args, "start_delay_s", 0.2)),
@@ -1913,7 +1934,7 @@ class ArmPickingCoordinator(Node):
             )
             publish_joint_trajectory_group(
                 [command],
-                dt=float(self._args.publish_dt),
+                dt=dt,
                 wait_subscriber_s=float(self._args.publish_wait_subscriber_s),
                 require_subscriber=bool(self._args.publish_require_subscriber),
                 retry_until_subscriber=bool(self._args.publish_retry_until_subscriber),
@@ -1936,7 +1957,7 @@ class ArmPickingCoordinator(Node):
             joint_path,
             joint_names,
             topic=str(self._args.publish_topic),
-            dt=float(self._args.publish_dt),
+            dt=dt,
             wait_subscriber_s=float(self._args.publish_wait_subscriber_s),
         )
 
@@ -1962,6 +1983,7 @@ class ArmPickingCoordinator(Node):
         *,
         stage: str,
         plan: SingleArmMotionPlan,
+        trajectory_duration_s: float | None = None,
     ) -> None:
         joint_names = _arm_joint_names(plan.arm)
         active_path = _build_active_joint_path(
@@ -2010,11 +2032,23 @@ class ArmPickingCoordinator(Node):
                     f"stage={stage} arm={plan.arm} waypoints={len(cmd_path)} "
                     f"goal={goal}"
                 )
+            publish_dt = _resolve_dt_for_trajectory_duration(
+                path_len=len(cmd_path),
+                duration_s=trajectory_duration_s,
+                default_dt=float(self._args.publish_dt),
+            )
+            if trajectory_duration_s is not None and float(trajectory_duration_s) > 0.0:
+                self.get_logger().info(
+                    "[TRAJ] using fixed trajectory duration: "
+                    f"stage={stage} arm={plan.arm} duration_s={float(trajectory_duration_s):.3f} "
+                    f"waypoints={len(cmd_path)} publish_dt={publish_dt:.6f}"
+                )
             try:
                 self._publish_single_arm_joint_path(
                     arm=plan.arm,
                     joint_names=joint_names,
                     joint_path=cmd_path,
+                    publish_dt=publish_dt,
                 )
             except RuntimeError as exc:
                 attempt_idx += 1
@@ -2067,7 +2101,7 @@ class ArmPickingCoordinator(Node):
 
             wait_s = _resolve_arrival_wait_s(
                 path_len=len(cmd_path),
-                dt=float(self._args.publish_dt),
+                dt=publish_dt,
                 configured_wait_s=float(getattr(self._args, "arrival_wait_s", -1.0)),
             )
             arrival_status, _current_positions, max_abs_err, stalled_for_s = (
@@ -2759,7 +2793,22 @@ class ArmPickingCoordinator(Node):
                     q_goal_cspace=grasp_selection.q_goal_cspace,
                     world_yml=object_world_yml,
                 )
-                self._wait_for_single_arm(stage="grasp", plan=grasp_plan)
+                grasp_trajectory_duration_s = (
+                    float(_GRASP_FALLBACK_TRAJECTORY_DURATION_S)
+                    if _is_grasp_fallback_source(grasp_selection.source)
+                    else None
+                )
+                if grasp_trajectory_duration_s is not None:
+                    self.get_logger().info(
+                        "[ARM_PICKING] fallback grasp trajectory duration override: "
+                        f"source={grasp_selection.source} "
+                        f"duration_s={grasp_trajectory_duration_s:.3f}"
+                    )
+                self._wait_for_single_arm(
+                    stage="grasp",
+                    plan=grasp_plan,
+                    trajectory_duration_s=grasp_trajectory_duration_s,
+                )
 
                 gripper_finish_seq = self._latest_gripper_finish_seq
                 self._publish_gripper_start(grasp_msg.selected_arm)
