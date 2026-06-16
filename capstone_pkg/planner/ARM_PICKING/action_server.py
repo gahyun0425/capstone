@@ -15,6 +15,7 @@ from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
+from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 
 from grasp_msgs.msg import ObjectAlign, ObjectGrasp
@@ -24,7 +25,6 @@ from capstone_pkg.planner.arm_rrt_common.path_publisher import (
     publish_joint_trajectory_group,
     read_joint_positions_once,
     send_joint_trajectory_action_group,
-    wait_for_joint_positions,
 )
 from capstone_pkg.planner.arm_rrt_common.plot import (
     save_ee_path_plot_3d_matplotlib,
@@ -102,7 +102,7 @@ _GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.03
 _SHELF_1_GRASP_COLLISION_OBJECT_SIZE_Z_OFFSET_M = 0.0
 _MIN_GRASP_COLLISION_OBJECT_SIZE_M = 0.001
 _SHELF_1_POST_GRASP_RAISE_Z_M = 0.30
-_SHELF_2_POST_GRASP_RAISE_Z_M = 0.05
+_SHELF_2_POST_GRASP_RAISE_Z_M = 0.03
 _PREFERRED_GRASP_QUATERNION_XYZW = (
     0.7071067811865475,
     5.551115123125783e-17,
@@ -636,6 +636,199 @@ def _joint_delta_l2(
             for idx in range(count)
         )
     )
+
+
+def _joint_delta_max_abs(
+    a: Sequence[float],
+    b: Sequence[float],
+) -> float:
+    if not a or not b:
+        return float("inf")
+    count = min(len(a), len(b))
+    if count <= 0:
+        return float("inf")
+    return max(
+        _wrapped_joint_delta(float(a[idx]), float(b[idx]))
+        for idx in range(count)
+    )
+
+
+def _wait_for_joint_motion_progress(
+    joint_names: Sequence[str],
+    *,
+    start_positions: Sequence[float],
+    goal_positions: Sequence[float],
+    topic: str,
+    wait_s: float,
+    poll_period_s: float,
+    progress_tolerance: float,
+    arrival_tolerance: float,
+) -> tuple[bool, list[float], float, float]:
+    if float(wait_s) <= 0.0:
+        return True, [], 0.0, float("inf")
+
+    owns_rclpy = False
+    if not rclpy.ok():
+        rclpy.init()
+        owns_rclpy = True
+
+    node = Node("joint_progress_waiter")
+    qos = QoSProfile(depth=1)
+    qos.reliability = ReliabilityPolicy.RELIABLE
+    qos.durability = DurabilityPolicy.VOLATILE
+    latest_by_name: dict[str, float] = {}
+    latest_positions = [float("nan") for _ in joint_names]
+    max_progress = 0.0
+    latest_goal_err = float("inf")
+    saw_sample = False
+
+    def _cb(msg: JointState) -> None:
+        nonlocal saw_sample, latest_positions, max_progress, latest_goal_err
+        saw_sample = True
+        name_to_idx = {name: idx for idx, name in enumerate(msg.name)}
+        for joint_name in joint_names:
+            idx = name_to_idx.get(joint_name)
+            if idx is None or idx >= len(msg.position):
+                continue
+            latest_by_name[joint_name] = float(msg.position[idx])
+
+        missing = [name for name in joint_names if name not in latest_by_name]
+        if missing:
+            return
+
+        latest_positions = [latest_by_name[name] for name in joint_names]
+        max_progress = max(
+            max_progress,
+            _joint_delta_max_abs(latest_positions, start_positions),
+        )
+        latest_goal_err = _joint_delta_max_abs(latest_positions, goal_positions)
+
+    sub = node.create_subscription(JointState, topic, _cb, qos)
+    deadline = time.monotonic() + float(wait_s)
+    try:
+        while rclpy.ok() and time.monotonic() < deadline:
+            if (
+                latest_goal_err <= float(arrival_tolerance)
+                or max_progress >= float(progress_tolerance)
+            ):
+                return True, list(latest_positions), float(max_progress), float(latest_goal_err)
+            rclpy.spin_once(node, timeout_sec=min(0.05, float(poll_period_s)))
+    finally:
+        del sub
+        node.destroy_node()
+        if owns_rclpy:
+            rclpy.shutdown()
+
+    if not saw_sample:
+        raise RuntimeError(f"No JointState received on {topic} within {wait_s:.2f}s")
+    return False, list(latest_positions), float(max_progress), float(latest_goal_err)
+
+
+def _wait_for_joint_arrival_or_stall(
+    joint_names: Sequence[str],
+    target_positions: Sequence[float],
+    *,
+    topic: str,
+    wait_s: float,
+    tolerance: float,
+    poll_period_s: float,
+    stall_timeout_s: float,
+    stall_tolerance: float,
+) -> tuple[str, list[float], float, float]:
+    if not joint_names:
+        raise ValueError("joint_names is empty")
+    if len(joint_names) != len(target_positions):
+        raise ValueError(
+            f"len(joint_names)={len(joint_names)} != len(target_positions)={len(target_positions)}"
+        )
+    if tolerance < 0.0:
+        raise ValueError("tolerance must be >= 0")
+    if poll_period_s <= 0.0:
+        raise ValueError("poll_period_s must be > 0")
+    if stall_timeout_s < 0.0:
+        raise ValueError("stall_timeout_s must be >= 0")
+    if stall_tolerance < 0.0:
+        raise ValueError("stall_tolerance must be >= 0")
+
+    owns_rclpy = False
+    if not rclpy.ok():
+        rclpy.init()
+        owns_rclpy = True
+
+    node = Node("joint_arrival_stall_waiter")
+    qos = QoSProfile(depth=1)
+    qos.reliability = ReliabilityPolicy.RELIABLE
+    qos.durability = DurabilityPolicy.VOLATILE
+    latest_by_name: dict[str, float] = {}
+    latest_positions = [float("nan") for _ in joint_names]
+    latest_max_abs_err = float("inf")
+    saw_message = False
+    saw_full_sample = False
+    last_motion_positions: list[float] | None = None
+    last_motion_t = time.monotonic()
+
+    def _cb(msg: JointState) -> None:
+        nonlocal saw_message, saw_full_sample, latest_positions, latest_max_abs_err
+        nonlocal last_motion_positions, last_motion_t
+        saw_message = True
+        name_to_idx = {name: idx for idx, name in enumerate(msg.name)}
+        for joint_name in joint_names:
+            idx = name_to_idx.get(joint_name)
+            if idx is None or idx >= len(msg.position):
+                continue
+            latest_by_name[joint_name] = float(msg.position[idx])
+
+        missing = [name for name in joint_names if name not in latest_by_name]
+        if missing:
+            return
+
+        now = time.monotonic()
+        latest_positions = [latest_by_name[name] for name in joint_names]
+        latest_max_abs_err = _joint_delta_max_abs(latest_positions, target_positions)
+        if last_motion_positions is None:
+            last_motion_positions = list(latest_positions)
+            last_motion_t = now
+        elif _joint_delta_max_abs(latest_positions, last_motion_positions) >= float(stall_tolerance):
+            last_motion_positions = list(latest_positions)
+            last_motion_t = now
+        saw_full_sample = True
+
+    sub = node.create_subscription(JointState, topic, _cb, qos)
+    deadline = None if float(wait_s) < 0.0 else time.monotonic() + float(wait_s)
+    try:
+        while rclpy.ok():
+            if latest_max_abs_err <= float(tolerance):
+                return "arrived", list(latest_positions), float(latest_max_abs_err), 0.0
+            if (
+                stall_timeout_s > 0.0
+                and saw_full_sample
+                and time.monotonic() - last_motion_t >= float(stall_timeout_s)
+            ):
+                return (
+                    "stalled",
+                    list(latest_positions),
+                    float(latest_max_abs_err),
+                    time.monotonic() - last_motion_t,
+                )
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            rclpy.spin_once(node, timeout_sec=min(0.05, float(poll_period_s)))
+    finally:
+        del sub
+        node.destroy_node()
+        if owns_rclpy:
+            rclpy.shutdown()
+
+    if not saw_message:
+        raise RuntimeError(
+            f"No JointState received on {topic} within {max(0.0, float(wait_s)):.2f}s"
+        )
+    if not saw_full_sample:
+        missing = [name for name in joint_names if name not in latest_by_name]
+        raise RuntimeError(
+            f"Timed out waiting for joints on {topic}; missing: {missing[:6]}{' ...' if len(missing) > 6 else ''}"
+        )
+    return "timeout", list(latest_positions), float(latest_max_abs_err), 0.0
 
 
 def _xyz_distance(a: Sequence[float], b: Sequence[float]) -> float:
@@ -1834,20 +2027,62 @@ class ArmPickingCoordinator(Node):
                     f"failed for {plan.arm} arm: {exc}. Retrying."
                 )
                 continue
+
+            progress_check_s = float(getattr(self._args, "arrival_progress_check_s", 0.0))
+            progress_tol = float(getattr(self._args, "arrival_progress_tolerance", 0.01))
+            arrival_tol = float(getattr(self._args, "arrival_joint_tolerance", 0.05))
+            if (
+                progress_check_s > 0.0
+                and len(cmd_path) > 1
+                and _joint_delta_max_abs(cmd_path[0], goal) > progress_tol
+            ):
+                try:
+                    progressed, _current_positions, max_progress, goal_err = (
+                        _wait_for_joint_motion_progress(
+                            joint_names,
+                            start_positions=cmd_path[0],
+                            goal_positions=goal,
+                            topic=str(self._args.joint_state_topic),
+                            wait_s=progress_check_s,
+                            poll_period_s=float(getattr(self._args, "arrival_poll_s", 0.05)),
+                            progress_tolerance=progress_tol,
+                            arrival_tolerance=arrival_tol,
+                        )
+                    )
+                except RuntimeError as exc:
+                    self.get_logger().warning(
+                        f"[ARRIVAL] progress check skipped for {plan.arm} arm: {exc}"
+                    )
+                else:
+                    if not progressed:
+                        last_err = goal_err
+                        attempt_idx += 1
+                        self.get_logger().warning(
+                            f"[ARRIVAL] {plan.arm} arm showed no joint progress within "
+                            f"{progress_check_s:.2f}s after publish "
+                            f"(max_progress={max_progress:.6f}, goal_err={goal_err:.6f}); "
+                            "re-publishing immediately."
+                        )
+                        continue
+
             wait_s = _resolve_arrival_wait_s(
                 path_len=len(cmd_path),
                 dt=float(self._args.publish_dt),
                 configured_wait_s=float(getattr(self._args, "arrival_wait_s", -1.0)),
             )
-            arrived, _current_positions, max_abs_err = wait_for_joint_positions(
-                joint_names,
-                goal,
-                topic=str(self._args.joint_state_topic),
-                wait_s=wait_s,
-                tolerance=float(getattr(self._args, "arrival_joint_tolerance", 0.05)),
-                poll_period_s=float(getattr(self._args, "arrival_poll_s", 0.05)),
+            arrival_status, _current_positions, max_abs_err, stalled_for_s = (
+                _wait_for_joint_arrival_or_stall(
+                    joint_names,
+                    goal,
+                    topic=str(self._args.joint_state_topic),
+                    wait_s=wait_s,
+                    tolerance=float(getattr(self._args, "arrival_joint_tolerance", 0.05)),
+                    poll_period_s=float(getattr(self._args, "arrival_poll_s", 0.05)),
+                    stall_timeout_s=float(getattr(self._args, "arrival_stall_timeout_s", 1.0)),
+                    stall_tolerance=float(getattr(self._args, "arrival_stall_tolerance", 0.005)),
+                )
             )
-            if arrived:
+            if arrival_status == "arrived":
                 if attempt_idx > 0:
                     self.get_logger().info(
                         f"[ARRIVAL] confirmed after retry for {plan.arm} arm: "
@@ -1856,6 +2091,14 @@ class ArmPickingCoordinator(Node):
                 return
             last_err = max_abs_err
             attempt_idx += 1
+            if arrival_status == "stalled":
+                self.get_logger().warning(
+                    f"[ARRIVAL] {plan.arm} arm stalled during attempt "
+                    f"{_format_attempt(attempt_idx - 1, max_attempts)}: "
+                    f"stalled_for={stalled_for_s:.2f}s max_abs_err={max_abs_err:.6f}. "
+                    "Re-publishing from current joint position."
+                )
+                continue
             self.get_logger().warning(
                 f"[ARRIVAL] {plan.arm} arm not at goal after attempt "
                 f"{_format_attempt(attempt_idx - 1, max_attempts)}: max_abs_err={max_abs_err:.6f}. "
@@ -2133,34 +2376,107 @@ class ArmPickingCoordinator(Node):
                 )
                 continue
 
+            progress_check_s = float(getattr(self._args, "arrival_progress_check_s", 0.0))
+            progress_tol = float(getattr(self._args, "arrival_progress_tolerance", 0.01))
+            arrival_tol = float(getattr(self._args, "arrival_joint_tolerance", 0.05))
+            if progress_check_s > 0.0:
+                cmd_selected_path = _build_active_joint_path(
+                    cmd_full_path,
+                    plan.cspace_joint_names,
+                    selected_joint_names,
+                )
+                cmd_other_path = _build_active_joint_path(
+                    cmd_full_path,
+                    plan.cspace_joint_names,
+                    other_joint_names,
+                )
+                no_progress_failures: list[str] = []
+                for arm_name, joint_names, cmd_path, goal in (
+                    (selected_arm, selected_joint_names, cmd_selected_path, selected_goal),
+                    (other_arm, other_joint_names, cmd_other_path, other_goal),
+                ):
+                    if (
+                        len(cmd_path) <= 1
+                        or _joint_delta_max_abs(cmd_path[0], goal) <= progress_tol
+                    ):
+                        continue
+                    try:
+                        progressed, _current_positions, max_progress, goal_err = (
+                            _wait_for_joint_motion_progress(
+                                joint_names,
+                                start_positions=cmd_path[0],
+                                goal_positions=goal,
+                                topic=str(self._args.joint_state_topic),
+                                wait_s=progress_check_s,
+                                poll_period_s=float(getattr(self._args, "arrival_poll_s", 0.05)),
+                                progress_tolerance=progress_tol,
+                                arrival_tolerance=arrival_tol,
+                            )
+                        )
+                    except RuntimeError as exc:
+                        self.get_logger().warning(
+                            f"[ARRIVAL] progress check skipped for {arm_name} arm: {exc}"
+                        )
+                        continue
+                    if not progressed:
+                        no_progress_failures.append(
+                            f"{arm_name}: max_progress={max_progress:.6f}, goal_err={goal_err:.6f}"
+                        )
+
+                if no_progress_failures:
+                    last_failure = "; ".join(no_progress_failures)
+                    attempt_idx += 1
+                    self.get_logger().warning(
+                        f"[ARRIVAL] dual-arm align showed no joint progress within "
+                        f"{progress_check_s:.2f}s after publish: {last_failure}; "
+                        "re-publishing immediately."
+                    )
+                    continue
+
             wait_s = _resolve_arrival_wait_s(
                 path_len=len(cmd_full_path),
                 dt=float(self._args.publish_dt),
                 configured_wait_s=float(getattr(self._args, "arrival_wait_s", -1.0)),
             )
             failures: list[str] = []
+            stalled_failures: list[str] = []
             for arm_name, joint_names, goal in (
                 (selected_arm, selected_joint_names, selected_goal),
                 (other_arm, other_joint_names, other_goal),
             ):
-                arrived, _current_positions, max_abs_err = wait_for_joint_positions(
-                    joint_names,
-                    goal,
-                    topic=str(self._args.joint_state_topic),
-                    wait_s=wait_s,
-                    tolerance=float(getattr(self._args, "arrival_joint_tolerance", 0.05)),
-                    poll_period_s=float(getattr(self._args, "arrival_poll_s", 0.05)),
+                arrival_status, _current_positions, max_abs_err, stalled_for_s = (
+                    _wait_for_joint_arrival_or_stall(
+                        joint_names,
+                        goal,
+                        topic=str(self._args.joint_state_topic),
+                        wait_s=wait_s,
+                        tolerance=float(getattr(self._args, "arrival_joint_tolerance", 0.05)),
+                        poll_period_s=float(getattr(self._args, "arrival_poll_s", 0.05)),
+                        stall_timeout_s=float(getattr(self._args, "arrival_stall_timeout_s", 1.0)),
+                        stall_tolerance=float(getattr(self._args, "arrival_stall_tolerance", 0.005)),
+                    )
                 )
-                if not arrived:
+                if arrival_status == "stalled":
+                    stalled_failures.append(
+                        f"{arm_name}: stalled_for={stalled_for_s:.2f}s max_abs_err={max_abs_err:.6f}"
+                    )
+                elif arrival_status != "arrived":
                     failures.append(f"{arm_name}: max_abs_err={max_abs_err:.6f}")
 
-            if not failures:
+            if not stalled_failures and not failures:
                 if attempt_idx > 0:
                     self.get_logger().info("[ARRIVAL] dual-arm align confirmed after retry.")
                 return
 
-            last_failure = "; ".join(failures)
+            last_failure = "; ".join(stalled_failures or failures)
             attempt_idx += 1
+            if stalled_failures:
+                self.get_logger().warning(
+                    f"[ARRIVAL] dual-arm align stalled during attempt "
+                    f"{_format_attempt(attempt_idx - 1, max_attempts)}: {last_failure}. "
+                    "Re-publishing from current joint positions."
+                )
+                continue
             self.get_logger().warning(
                 f"[ARRIVAL] dual-arm align not confirmed after attempt "
                 f"{_format_attempt(attempt_idx - 1, max_attempts)}: {last_failure}. "
@@ -2761,6 +3077,30 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
         type=float,
         default=-1.0,
         help="wait time [s] for gripper_finish after gripper_start; -1 waits forever",
+    )
+    parser.add_argument(
+        "--arrival_progress_check_s",
+        type=float,
+        default=1.0,
+        help="after each trajectory publish, re-publish immediately if joints do not move within this many seconds; 0 disables",
+    )
+    parser.add_argument(
+        "--arrival_progress_tolerance",
+        type=float,
+        default=0.01,
+        help="minimum max joint movement [rad] considered progress after trajectory publish",
+    )
+    parser.add_argument(
+        "--arrival_stall_timeout_s",
+        type=float,
+        default=1.0,
+        help="during arrival wait, re-publish from current position if joints do not move for this many seconds; 0 disables",
+    )
+    parser.add_argument(
+        "--arrival_stall_tolerance",
+        type=float,
+        default=0.005,
+        help="minimum max joint movement [rad] that resets the in-motion stall timer",
     )
     parser.add_argument(
         "--grasp_object_name",
