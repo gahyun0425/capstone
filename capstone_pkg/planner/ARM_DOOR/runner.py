@@ -12,7 +12,7 @@ import time
 from typing import Any, Mapping, Sequence
 
 import rclpy
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Pose2D, Twist
 from rclpy.node import Node
 from rclpy.qos import DurabilityPolicy, HistoryPolicy, QoSProfile, ReliabilityPolicy
 from std_msgs.msg import Bool
@@ -447,7 +447,7 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--post_open_ingress_yaw_deg",
         type=float,
-        default=-20.0,
+        default=-10.0,
         help="base yaw delta to apply during the post-open inward drive",
     )
     ap.add_argument(
@@ -557,12 +557,15 @@ def _build_arm_door_parser():
         "--post_one_step_door_close",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="after arm_door_finish, wait for one_step_finish and back the base up to close the door",
+        help=(
+            "after arm_door_finish, wait for one_step_finish and back "
+            "the base up to close the door"
+        ),
     )
     ap.add_argument(
         "--post_one_step_reverse_distance_m",
         type=float,
-        default=0.10,
+        default=0.50,
         help="base reverse distance after one_step_finish",
     )
     ap.add_argument(
@@ -571,6 +574,26 @@ def _build_arm_door_parser():
         default=0.10,
         help="base reverse speed after one_step_finish",
     )
+    ap.add_argument(
+        "--post_one_step_align_yaw",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "align the mobile-base yaw to --post_one_step_target_yaw_deg "
+            "before the post-one-step reverse move"
+        ),
+    )
+    ap.add_argument(
+        "--post_one_step_base_pose_topic",
+        default="/base_pose",
+        help="Pose2D feedback topic used for post-one-step absolute yaw alignment",
+    )
+    ap.add_argument("--post_one_step_target_yaw_deg", type=float, default=0.0)
+    ap.add_argument("--post_one_step_yaw_tolerance_deg", type=float, default=2.0)
+    ap.add_argument("--post_one_step_yaw_timeout_s", type=float, default=8.0)
+    ap.add_argument("--post_one_step_base_pose_wait_s", type=float, default=1.0)
+    ap.add_argument("--post_one_step_yaw_kp", type=float, default=1.5)
+    ap.add_argument("--post_one_step_yaw_min_speed_rps", type=float, default=0.05)
     ap.add_argument("--door_handle_align_topic", default="/door_handle_align_result")
     ap.add_argument("--finish_publish_repeat", type=int, default=1)
     ap.add_argument("--finish_publish_period_s", type=float, default=0.05)
@@ -1297,7 +1320,7 @@ def _run_post_open_release_retreat_zero_ingress(
         distance_m=float(getattr(args, "post_open_ingress_distance_m", 0.40)),
         speed_mps=float(getattr(args, "post_open_ingress_speed_mps", 0.10)),
         label="ingress",
-        yaw_delta_deg=float(getattr(args, "post_open_ingress_yaw_deg", -20.0)),
+        yaw_delta_deg=float(getattr(args, "post_open_ingress_yaw_deg", -10.0)),
     )
 
 
@@ -1855,6 +1878,170 @@ def _base_pose_delta_to_body_twist(
         or abs(wz_clamped - wz) > 1.0e-9
     )
     return vx_clamped, vy_clamped, wz_clamped, clamped
+
+
+def _publish_base_stop_with_node(node: Node, pub, args, *, cmd_period_s: float) -> None:
+    stop_msg = Twist()
+    stop_end = time.monotonic() + max(0.0, float(args.real_base_stop_duration_s))
+    while rclpy.ok() and time.monotonic() < stop_end:
+        pub.publish(stop_msg)
+        rclpy.spin_once(node, timeout_sec=0.0)
+        time.sleep(min(0.05, max(0.001, float(cmd_period_s))))
+
+
+def _publish_post_one_step_base_reset(args) -> None:
+    owns_rclpy = False
+    if not rclpy.ok():
+        rclpy.init()
+        owns_rclpy = True
+
+    node = Node("arm_door_post_one_step_base_reset")
+    pub = node.create_publisher(Twist, str(args.real_base_cmd_vel_topic), 10)
+    wait_deadline = (
+        time.monotonic() + max(0.0, float(args.publish_wait_subscriber_s))
+    )
+    while (
+        rclpy.ok()
+        and pub.get_subscription_count() == 0
+        and time.monotonic() < wait_deadline
+    ):
+        rclpy.spin_once(node, timeout_sec=0.05)
+
+    cmd_period_s = 1.0 / max(1.0, float(args.real_base_cmd_rate_hz))
+    try:
+        if bool(getattr(args, "post_one_step_align_yaw", True)):
+            _publish_post_one_step_yaw_align_with_node(
+                args,
+                node=node,
+                pub=pub,
+                cmd_period_s=cmd_period_s,
+            )
+        _publish_post_one_step_reverse_with_node(
+            args,
+            node=node,
+            pub=pub,
+            cmd_period_s=cmd_period_s,
+        )
+    finally:
+        node.destroy_node()
+        if owns_rclpy:
+            rclpy.shutdown()
+
+
+def _publish_post_one_step_yaw_align_with_node(
+    args,
+    *,
+    node: Node,
+    pub,
+    cmd_period_s: float,
+) -> None:
+    pose_box: dict[str, Any] = {"pose": None}
+
+    def _on_pose(msg: Pose2D) -> None:
+        pose_box["pose"] = msg
+
+    pose_topic = str(getattr(args, "post_one_step_base_pose_topic", "/base_pose"))
+    sub = node.create_subscription(Pose2D, pose_topic, _on_pose, 10)
+    wait_deadline = time.monotonic() + max(
+        0.0,
+        float(getattr(args, "post_one_step_base_pose_wait_s", 1.0)),
+    )
+    while (
+        rclpy.ok()
+        and pose_box["pose"] is None
+        and time.monotonic() < wait_deadline
+    ):
+        rclpy.spin_once(node, timeout_sec=0.05)
+
+    if pose_box["pose"] is None:
+        node.get_logger().warning(
+            "Post one_step yaw alignment skipped: "
+            f"no Pose2D feedback received on {pose_topic}"
+        )
+        node.destroy_subscription(sub)
+        return
+
+    target_yaw = math.radians(
+        float(getattr(args, "post_one_step_target_yaw_deg", 0.0))
+    )
+    tolerance = math.radians(
+        max(0.0, float(getattr(args, "post_one_step_yaw_tolerance_deg", 2.0)))
+    )
+    timeout_s = max(0.0, float(getattr(args, "post_one_step_yaw_timeout_s", 8.0)))
+    kp = max(0.0, float(getattr(args, "post_one_step_yaw_kp", 1.5)))
+    min_speed = max(
+        0.0,
+        abs(float(getattr(args, "post_one_step_yaw_min_speed_rps", 0.05))),
+    )
+    max_angular = max(1.0e-3, abs(float(args.real_base_max_angular_rps)))
+    align_deadline = time.monotonic() + timeout_s
+    last_err = 0.0
+
+    node.get_logger().info(
+        "Post one_step yaw alignment: "
+        f"target={math.degrees(target_yaw):.1f}deg "
+        f"tolerance={math.degrees(tolerance):.1f}deg "
+        f"feedback={pose_topic}"
+    )
+
+    while rclpy.ok() and time.monotonic() < align_deadline:
+        rclpy.spin_once(node, timeout_sec=0.0)
+        pose = pose_box["pose"]
+        if pose is None:
+            break
+        err = _wrap_pi(target_yaw - float(pose.theta))
+        last_err = err
+        if abs(err) <= tolerance:
+            node.get_logger().info(
+                "Post one_step yaw alignment complete: "
+                f"error={math.degrees(err):.2f}deg"
+            )
+            break
+        cmd = Twist()
+        wz = max(-max_angular, min(max_angular, kp * err))
+        if min_speed > 0.0 and abs(wz) < min_speed:
+            wz = math.copysign(min(min_speed, max_angular), err)
+        cmd.angular.z = float(wz)
+        pub.publish(cmd)
+        time.sleep(min(max(0.001, float(cmd_period_s)), 0.05))
+    else:
+        node.get_logger().warning(
+            "Post one_step yaw alignment timed out: "
+            f"last_error={math.degrees(last_err):.2f}deg"
+        )
+
+    _publish_base_stop_with_node(node, pub, args, cmd_period_s=cmd_period_s)
+    node.destroy_subscription(sub)
+
+
+def _publish_post_one_step_reverse_with_node(
+    args,
+    *,
+    node: Node,
+    pub,
+    cmd_period_s: float,
+) -> None:
+    distance_m = max(0.0, float(args.post_one_step_reverse_distance_m))
+    speed_mps = max(1.0e-3, abs(float(args.post_one_step_reverse_speed_mps)))
+    max_linear = max(1.0e-3, abs(float(args.real_base_max_linear_mps)))
+    speed_mps = min(speed_mps, max_linear)
+    duration_s = distance_m / speed_mps if distance_m > 0.0 else 0.0
+    node.get_logger().info(
+        "Post one_step base reverse: "
+        f"{distance_m:.3f}m at {speed_mps:.3f}m/s on {args.real_base_cmd_vel_topic}"
+    )
+
+    reverse_msg = Twist()
+    reverse_msg.linear.x = -speed_mps
+    end_time = time.monotonic() + duration_s
+    while rclpy.ok() and time.monotonic() < end_time:
+        pub.publish(reverse_msg)
+        rclpy.spin_once(node, timeout_sec=0.0)
+        remaining = end_time - time.monotonic()
+        if remaining > 0.0:
+            time.sleep(min(float(cmd_period_s), remaining))
+
+    _publish_base_stop_with_node(node, pub, args, cmd_period_s=cmd_period_s)
 
 
 def _base_path_distance(base_poses: Sequence[Sequence[float]]) -> tuple[float, float]:
@@ -4661,11 +4848,6 @@ class ArmDoorSequenceNode(Node):
             str(args.arm_picking_finish_topic),
             self._align_qos,
         )
-        self._post_one_step_base_pub = self.create_publisher(
-            Twist,
-            str(args.real_base_cmd_vel_topic),
-            10,
-        )
         self._start_sub = self.create_subscription(
             Bool,
             str(args.arm_door_start_topic),
@@ -4880,6 +5062,8 @@ class ArmDoorSequenceNode(Node):
         self.get_logger().info("Post one_step reverse door close path complete")
         self._publish_post_close_release_and_reset(plan)
         self._door_close_plan = None
+        _publish_post_one_step_base_reset(self._args)
+        self.get_logger().info("Post one_step base yaw alignment/reverse complete")
         self._publish_arm_picking_finish()
 
     def _publish_post_close_release_and_reset(self, plan: DoorClosePlan | None = None) -> None:
@@ -4898,32 +5082,13 @@ class ArmDoorSequenceNode(Node):
         self.get_logger().info("Right gripper open and right arm zero command complete")
 
     def _publish_post_one_step_reverse(self) -> None:
-        distance_m = max(0.0, float(self._args.post_one_step_reverse_distance_m))
-        speed_mps = max(1.0e-3, abs(float(self._args.post_one_step_reverse_speed_mps)))
-        max_linear = max(1.0e-3, abs(float(self._args.real_base_max_linear_mps)))
-        speed_mps = min(speed_mps, max_linear)
-        duration_s = distance_m / speed_mps if distance_m > 0.0 else 0.0
-        cmd_period_s = 1.0 / max(1.0, float(self._args.real_base_cmd_rate_hz))
         self.get_logger().info(
-            "Received one_step_finish=True; reversing base "
-            f"{distance_m:.3f}m at {speed_mps:.3f}m/s on {self._args.real_base_cmd_vel_topic}"
+            "Received one_step_finish=True; executing base yaw alignment/reverse fallback"
         )
-
-        reverse_msg = Twist()
-        reverse_msg.linear.x = -speed_mps
-        end_time = time.monotonic() + duration_s
-        while rclpy.ok() and time.monotonic() < end_time:
-            self._post_one_step_base_pub.publish(reverse_msg)
-            remaining = end_time - time.monotonic()
-            if remaining > 0.0:
-                time.sleep(min(cmd_period_s, remaining))
-
-        stop_msg = Twist()
-        stop_end = time.monotonic() + max(0.0, float(self._args.real_base_stop_duration_s))
-        while rclpy.ok() and time.monotonic() < stop_end:
-            self._post_one_step_base_pub.publish(stop_msg)
-            time.sleep(min(0.05, max(0.001, cmd_period_s)))
-        self.get_logger().warning("Post one_step base-only reverse fallback complete")
+        _publish_post_one_step_base_reset(self._args)
+        self.get_logger().warning(
+            "Post one_step base-only yaw alignment/reverse fallback complete"
+        )
         self._publish_post_close_release_and_reset()
         self._publish_arm_picking_finish()
 

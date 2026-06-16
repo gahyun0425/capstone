@@ -41,11 +41,6 @@ from capstone_pkg.kinematics.curobo_ik import (
     get_single_arm_ik,
     warmup_single_arm_ik_reachable,
 )
-from capstone_pkg.kinematics.force_curobo_ik import ForceCuroboIK
-from capstone_pkg.collision_check.collision import get_self_collision_checker
-from capstone_pkg.constraint_projection.constraint import RigidConstraint
-from capstone_pkg.constraint_projection.projection import ManifoldProjectorTorch
-from capstone_pkg.planner.tbrrt.batch.conext import plan_tbrrt_extcon_batch_conext
 from capstone_pkg.planner.arm_rrt_common.single_arm_runner import (
     _merge_world_with_user_object,
     _publish_world_collision_for_mujoco,
@@ -60,10 +55,8 @@ from capstone_pkg.utils.config import (
     LONG_SHELF_YAML,
     RIGHT_EE_FRAME,
     RIGHT_JOINTS,
-    ROBOT_URDF,
     SHELF_YAML,
 )
-from capstone_pkg.utils.joint_limit import load_joint_limits_torch
 
 
 _PKG_ROOT = Path(__file__).resolve().parents[3]
@@ -126,16 +119,6 @@ _GRASP_FALLBACK_Z_OFFSET_M = 0.02
 _GRASP_FALLBACK_X_OFFSET_M = -0.0
 _GRASP_FALLBACK_TRAJECTORY_DURATION_S = 3.0
 _ZERO_JOINT_TOL = 1.0e-4
-_PRINGLES_PREGRASP_CLEARANCE_Y_M = 0.05
-_PRINGLES_INWARD_Y_M = 0.06
-_PRINGLES_SIDE_GRASP_Z_OFFSET_M = 0.01
-_PRINGLES_COLLISION_OBJECT_SIZE_Y_OFFSET_M = 0.03
-_PRINGLES_RIGID_RAISE_Z_M = 0.05
-_PRINGLES_FINAL_LEFT_X_M = 0.4
-_PRINGLES_FINAL_LEFT_Y_M = 0.165
-_PRINGLES_FINAL_LEFT_Z_M = 1.3
-_PRINGLES_FORCE_IK_NUM_TRIALS = 24
-_PRINGLES_FORCE_IK_NUM_SEEDS = 20
 
 
 class FixedZRetreatIKError(RuntimeError):
@@ -190,19 +173,6 @@ def _pose_orientation_wxyz(pose: Pose) -> list[float]:
         float(pose.orientation.y),
         float(pose.orientation.z),
     ]
-
-
-def _quat_xyzw_from_values(values: Sequence[float]) -> Quaternion:
-    if len(values) < 4:
-        raise ValueError("quaternion sequence must have length 4")
-    return _normalize_orientation(
-        Quaternion(
-            x=float(values[0]),
-            y=float(values[1]),
-            z=float(values[2]),
-            w=float(values[3]),
-        )
-    )
 
 
 def _vector3_xyz(vec: Vector3) -> list[float]:
@@ -454,24 +424,6 @@ def _is_snack_grasp_msg(msg: ObjectGrasp) -> bool:
     return "과자" in label or label_lower in {"snack", "snacks"}
 
 
-def _is_pringles_msg(msg) -> bool:
-    text_parts: list[str] = []
-    for attr in (
-        "label",
-        "object_label",
-        "object_name",
-        "class_name",
-        "name",
-        "category",
-    ):
-        value = getattr(msg, attr, None)
-        if value is not None:
-            text_parts.append(str(value))
-    text = " ".join(text_parts).strip()
-    text_lower = text.lower()
-    return "프링글" in text or "pringles" in text_lower
-
-
 def _is_grasp_fallback_source(source: str) -> bool:
     normalized = str(source).strip().lower()
     return normalized.startswith("object_center") or normalized.startswith("snack_object_center")
@@ -487,61 +439,6 @@ def _build_post_grasp_staging_pose(arm: str, base_pose: Pose) -> Pose:
     pose = _copy_pose(base_pose)
     pose.position.x = 0.4
     pose.position.y = 0.2 if normalize_arm_name(arm) == "left" else -0.2
-    return pose
-
-
-def _default_dual_grasp_orientation(arm: str) -> Quaternion:
-    quat_xyzw = (
-        _LEFT_SHELF_2_ALIGN_QUATERNION_XYZW
-        if normalize_arm_name(arm) == "left"
-        else _FIXED_ALIGN_QUATERNION_XYZW
-    )
-    return _normalize_orientation(
-        Quaternion(
-            x=float(quat_xyzw[0]),
-            y=float(quat_xyzw[1]),
-            z=float(quat_xyzw[2]),
-            w=float(quat_xyzw[3]),
-        )
-    )
-
-
-def _build_pringles_side_pose(
-    msg: ObjectGrasp,
-    *,
-    arm: str,
-    inward_m: float = 0.0,
-    align_orientations: dict[str, Quaternion] | None = None,
-) -> Pose:
-    normalized_arm = normalize_arm_name(arm)
-    center = msg.object_pose.position
-    half_y_m = 0.5 * abs(float(msg.object_size.y))
-    clearance_m = float(_PRINGLES_PREGRASP_CLEARANCE_Y_M)
-    inward_m = max(0.0, float(inward_m))
-    side_offset = half_y_m + clearance_m - inward_m
-    if normalized_arm == "right":
-        side_offset = -side_offset
-
-    pose = Pose()
-    pose.position.x = float(center.x)
-    pose.position.y = float(center.y) + float(side_offset)
-    pose.position.z = float(center.z) + float(_PRINGLES_SIDE_GRASP_Z_OFFSET_M)
-    align_orientation = None
-    if align_orientations is not None:
-        align_orientation = align_orientations.get(normalized_arm)
-    pose.orientation = (
-        _default_dual_grasp_orientation(normalized_arm)
-        if align_orientation is None
-        else _normalize_orientation(align_orientation)
-    )
-    return pose
-
-
-def _translated_pose(base_pose: Pose, delta_xyz: Sequence[float]) -> Pose:
-    pose = _copy_pose(base_pose)
-    pose.position.x = float(pose.position.x) + float(delta_xyz[0])
-    pose.position.y = float(pose.position.y) + float(delta_xyz[1])
-    pose.position.z = float(pose.position.z) + float(delta_xyz[2])
     return pose
 
 
@@ -1384,63 +1281,6 @@ class ArmPickingCoordinator(Node):
         )
         return [float(v) for v in kin.ee_position[0].detach().cpu().tolist()]
 
-    def _compute_arm_ee_orientation(
-        self,
-        *,
-        arm: str,
-        q_cspace: Sequence[float],
-        world_yml: str | None,
-    ) -> Quaternion:
-        import torch
-
-        normalized_arm = normalize_arm_name(arm)
-        ik = get_single_arm_ik(
-            self._args.robot_yml,
-            arm=normalized_arm,
-            cpu=bool(self._args.cpu),
-            world_yml=world_yml,
-        )
-        q_active = _extract_joint_positions(
-            q_cspace,
-            ik.cspace_joint_names,
-            ik.active_joint_names,
-        )
-        kin = ik.solver.fk(
-            torch.tensor(
-                [q_active],
-                device=ik.device,
-                dtype=torch.float32,
-            )
-        )
-        quat_wxyz = [float(v) for v in kin.ee_quaternion[0].detach().cpu().tolist()]
-        return _quat_xyzw_from_values(
-            [
-                quat_wxyz[1],
-                quat_wxyz[2],
-                quat_wxyz[3],
-                quat_wxyz[0],
-            ]
-        )
-
-    def _compute_dual_align_orientations(
-        self,
-        *,
-        q_cspace: Sequence[float],
-        world_yml: str | None,
-    ) -> dict[str, Quaternion]:
-        return {
-            "left": self._compute_arm_ee_orientation(
-                arm="left",
-                q_cspace=q_cspace,
-                world_yml=world_yml,
-            ),
-            "right": self._compute_arm_ee_orientation(
-                arm="right",
-                q_cspace=q_cspace,
-                world_yml=world_yml,
-            ),
-        }
-
     def _score_grasp_ik_solution(
         self,
         *,
@@ -2048,220 +1888,6 @@ class ArmPickingCoordinator(Node):
         )
         self._maybe_save_single_arm_plot(stage=stage, plan=plan, world_yml=world_yml)
         return plan
-
-    def _make_dual_path_plan(
-        self,
-        *,
-        q_start_cspace: Sequence[float],
-        q_goal_cspace: Sequence[float],
-        full_path: Sequence[Sequence[float]],
-        cspace_joint_names: Sequence[str],
-    ) -> SingleArmMotionPlan:
-        return SingleArmMotionPlan(
-            arm="left",
-            cspace_joint_names=[str(name) for name in cspace_joint_names],
-            active_joint_names=list(LEFT_JOINTS),
-            q_start_cspace=[float(v) for v in q_start_cspace],
-            q_goal_cspace=[float(v) for v in q_goal_cspace],
-            raw_path=[[float(v) for v in q] for q in full_path],
-            spline_path=[[float(v) for v in q] for q in full_path],
-        )
-
-    def _solve_dual_target_ik(
-        self,
-        *,
-        stage: str,
-        left_pose: Pose,
-        right_pose: Pose,
-        q_start_cspace: Sequence[float],
-        world_yml: str | None,
-    ) -> list[float]:
-        solver = ForceCuroboIK(
-            robot_yml=str(self._args.robot_yml),
-            urdf_path=str(getattr(self._args, "urdf_path", ROBOT_URDF)),
-            world_yml=world_yml,
-            cpu=bool(self._args.cpu),
-            num_seeds=int(getattr(self._args, "force_ik_num_seeds", _PRINGLES_FORCE_IK_NUM_SEEDS)),
-            use_cuda_graph=False,
-        )
-        ik_out = solver.solve_max_forward_force(
-            left_xyz=_pose_position_xyz(left_pose),
-            left_quat_wxyz=_pose_orientation_wxyz(left_pose),
-            right_xyz=_pose_position_xyz(right_pose),
-            right_quat_wxyz=_pose_orientation_wxyz(right_pose),
-            q_start_cspace=[float(v) for v in q_start_cspace],
-            forward_direction_base=[
-                float(v)
-                for v in getattr(self._args, "forward_direction_base", (1.0, 0.0, 0.0))
-            ],
-            num_trials=int(getattr(self._args, "force_ik_num_trials", _PRINGLES_FORCE_IK_NUM_TRIALS)),
-            seed_noise_std=float(getattr(self._args, "force_ik_seed_noise_std", self._args.ik_seed_noise_std)),
-            random_seed=int(getattr(self._args, "force_ik_random_seed", self._args.ik_seed)),
-        )
-        if not ik_out.success or ik_out.q_cspace is None:
-            raise RuntimeError(f"Dual-arm IK failed for {stage}")
-        self.get_logger().info(
-            "[PRINGLES] dual IK success: "
-            f"stage={stage} score={ik_out.score:.6f} "
-            f"valid={ik_out.valid_candidates}/{ik_out.tried_candidates} "
-            f"left_xyz={_pose_position_xyz(left_pose)} right_xyz={_pose_position_xyz(right_pose)}"
-        )
-        return [float(v) for v in ik_out.q_cspace]
-
-    def _plan_dual_target_independent_tbrrt(
-        self,
-        *,
-        stage: str,
-        q_start_cspace: Sequence[float],
-        q_goal_cspace: Sequence[float],
-        world_yml: str | None,
-    ) -> tuple[SingleArmMotionPlan, list[list[float]]]:
-        from capstone_pkg.planner.tbrrt.batch.single_arm_batch_conext import (
-            plan_single_arm_tbrrt_batch_conext,
-        )
-
-        q_start_list = [float(v) for v in q_start_cspace]
-        q_goal_list = [float(v) for v in q_goal_cspace]
-        cspace_joint_names = list(CSPACE_JOINT_NAMES_14)
-        t_start = time.perf_counter()
-        left_out = plan_single_arm_tbrrt_batch_conext(
-            robot_yml=self._args.robot_yml,
-            arm="left",
-            q_start=q_start_list,
-            q_goals=[q_goal_list],
-            world_yml=world_yml,
-            cpu=bool(self._args.cpu),
-            cfg=build_single_arm_tbrrt_config(self._args),
-            joint_limit_yml=str(self._args.joint_limit_yml),
-            block_k=int(self._args.tbrrt_block_k),
-        )
-        if not left_out.success or not left_out.path:
-            raise RuntimeError(f"Left-arm TBRRT failed for {stage}: {left_out.stats.extra}")
-        right_out = plan_single_arm_tbrrt_batch_conext(
-            robot_yml=self._args.robot_yml,
-            arm="right",
-            q_start=q_start_list,
-            q_goals=[q_goal_list],
-            world_yml=world_yml,
-            cpu=bool(self._args.cpu),
-            cfg=build_single_arm_tbrrt_config(self._args),
-            joint_limit_yml=str(self._args.joint_limit_yml),
-            block_k=int(self._args.tbrrt_block_k),
-        )
-        if not right_out.success or not right_out.path:
-            raise RuntimeError(f"Right-arm TBRRT failed for {stage}: {right_out.stats.extra}")
-
-        full_path = _combine_active_joint_paths(
-            cspace_joint_names=cspace_joint_names,
-            selected_joint_names=list(LEFT_JOINTS),
-            selected_path=_build_active_joint_path(
-                left_out.path,
-                cspace_joint_names,
-                LEFT_JOINTS,
-            ),
-            other_joint_names=list(RIGHT_JOINTS),
-            other_path=_build_active_joint_path(
-                right_out.path,
-                cspace_joint_names,
-                RIGHT_JOINTS,
-            ),
-        )
-        plan = self._make_dual_path_plan(
-            q_start_cspace=q_start_list,
-            q_goal_cspace=q_goal_list,
-            full_path=full_path,
-            cspace_joint_names=cspace_joint_names,
-        )
-        self.get_logger().info(
-            "[PRINGLES] independent dual target planned: "
-            f"stage={stage} waypoints={len(full_path)} "
-            f"planning_time={time.perf_counter() - t_start:.3f}s"
-        )
-        self._maybe_save_full_path_plot(
-            stage=stage,
-            full_path=full_path,
-            cspace_joint_names=cspace_joint_names,
-            world_yml=world_yml,
-        )
-        return plan, full_path
-
-    def _plan_dual_target_rigid_tbrrt(
-        self,
-        *,
-        stage: str,
-        q_start_cspace: Sequence[float],
-        q_goal_cspace: Sequence[float],
-        world_yml: str | None,
-    ) -> tuple[SingleArmMotionPlan, list[list[float]]]:
-        import torch
-
-        checker = get_self_collision_checker(
-            self._args.robot_yml,
-            cpu=bool(self._args.cpu),
-            world_yml=world_yml,
-        )
-        device = checker.tensor_args.device
-        dtype = torch.float32
-        q_start_list = [float(v) for v in q_start_cspace]
-        q_goal_list = [float(v) for v in q_goal_cspace]
-        cspace_joint_names = [str(name) for name in checker.cspace_names]
-        constraint = RigidConstraint(
-            robot_yml=str(self._args.robot_yml),
-            left_ee=LEFT_EE_FRAME,
-            right_ee=RIGHT_EE_FRAME,
-            q_ref=torch.tensor(q_start_list, device=device, dtype=dtype),
-            device=device,
-            dtype=dtype,
-            mode="se3",
-            rigid_orientation=True,
-        )
-        joint_limits = load_joint_limits_torch(
-            str(self._args.joint_limit_yml),
-            device=device,
-            dtype=dtype,
-        )
-        projector = ManifoldProjectorTorch(
-            constraint=constraint,
-            limits=joint_limits,
-            max_iters=60,
-            tol=1.0e-3,
-            fd_eps=1.0e-3,
-            damping=0.0,
-            step_size=1.0,
-        )
-        t_start = time.perf_counter()
-        out = plan_tbrrt_extcon_batch_conext(
-            q_start=q_start_list,
-            q_goals=[q_goal_list],
-            cfg=build_single_arm_tbrrt_config(self._args),
-            checker=checker,
-            projector=projector,
-            joint_limits=joint_limits,
-            device=device,
-            block_K=int(self._args.tbrrt_block_k),
-        )
-        if not out.success or not out.path:
-            raise RuntimeError(f"Rigid dual-arm TBRRT failed for {stage}: {out.stats.extra}")
-        full_path = [[float(v) for v in q] for q in out.path]
-        plan = self._make_dual_path_plan(
-            q_start_cspace=q_start_list,
-            q_goal_cspace=full_path[-1],
-            full_path=full_path,
-            cspace_joint_names=cspace_joint_names,
-        )
-        self.get_logger().info(
-            "[PRINGLES] rigid dual target planned: "
-            f"stage={stage} waypoints={len(full_path)} "
-            f"planning_time={time.perf_counter() - t_start:.3f}s "
-            f"stats={out.stats.extra}"
-        )
-        self._maybe_save_full_path_plot(
-            stage=stage,
-            full_path=full_path,
-            cspace_joint_names=cspace_joint_names,
-            world_yml=world_yml,
-        )
-        return plan, full_path
 
     def _publish_single_arm_joint_path(
         self,
@@ -3119,192 +2745,12 @@ class ArmPickingCoordinator(Node):
         else:
             self._publish_arm_picking_finish(arm, stage=stage)
 
-    def _execute_pringles_grasp_sequence(
-        self,
-        *,
-        selected_arm: str,
-        grasp_msg: ObjectGrasp,
-        object_world_yml: str | None,
-        motion_world_yml: str | None,
-        align_orientations: dict[str, Quaternion] | None,
-        use_one_step_finish_on_complete: bool,
-    ) -> None:
-        raw_object_size = _copy_vector3(grasp_msg.object_size)
-        raw_object_center = _copy_point(grasp_msg.object_pose.position)
-
-        pre_left_pose = _build_pringles_side_pose(
-            grasp_msg,
-            arm="left",
-            inward_m=0.0,
-            align_orientations=align_orientations,
-        )
-        pre_right_pose = _build_pringles_side_pose(
-            grasp_msg,
-            arm="right",
-            inward_m=0.0,
-            align_orientations=align_orientations,
-        )
-        contact_left_pose = _build_pringles_side_pose(
-            grasp_msg,
-            arm="left",
-            inward_m=float(_PRINGLES_INWARD_Y_M),
-            align_orientations=align_orientations,
-        )
-        contact_right_pose = _build_pringles_side_pose(
-            grasp_msg,
-            arm="right",
-            inward_m=float(_PRINGLES_INWARD_Y_M),
-            align_orientations=align_orientations,
-        )
-
-        q_start = read_joint_positions_once(
-            list(CSPACE_JOINT_NAMES_14),
-            topic=str(self._args.joint_state_topic),
-            wait_s=float(self._args.joint_state_wait_s),
-        )
-        pre_q_goal = self._solve_dual_target_ik(
-            stage="pringles_pregrasp",
-            left_pose=pre_left_pose,
-            right_pose=pre_right_pose,
-            q_start_cspace=q_start,
-            world_yml=object_world_yml,
-        )
-        pre_plan, pre_path = self._plan_dual_target_independent_tbrrt(
-            stage="pringles_pregrasp",
-            q_start_cspace=q_start,
-            q_goal_cspace=pre_q_goal,
-            world_yml=object_world_yml,
-        )
-        self._wait_for_both_arms(
-            stage="pringles_pregrasp",
-            plan=pre_plan,
-            full_path=pre_path,
-            selected_arm="left",
-            other_arm="right",
-        )
-        _publish_world_collision_for_mujoco(self._args, motion_world_yml)
-        self.get_logger().info(
-            "[PRINGLES] object collision removed after pregrasp; "
-            f"continuing with world_yml={motion_world_yml}"
-        )
-
-        contact_q_goal = self._solve_dual_target_ik(
-            stage="pringles_contact",
-            left_pose=contact_left_pose,
-            right_pose=contact_right_pose,
-            q_start_cspace=pre_path[-1],
-            world_yml=motion_world_yml,
-        )
-        contact_plan, contact_path = self._plan_dual_target_independent_tbrrt(
-            stage="pringles_contact",
-            q_start_cspace=pre_path[-1],
-            q_goal_cspace=contact_q_goal,
-            world_yml=motion_world_yml,
-        )
-        self._wait_for_both_arms(
-            stage="pringles_contact",
-            plan=contact_plan,
-            full_path=contact_path,
-            selected_arm="left",
-            other_arm="right",
-        )
-
-        gripper_finish_seq = self._latest_gripper_finish_seq
-        self._publish_gripper_start_for_arms(("left", "right"))
-        self._wait_for_gripper_finish(
-            arm=selected_arm,
-            min_seq=gripper_finish_seq,
-            timeout_s=float(self._args.gripper_finish_wait_s),
-        )
-
-        raised_left_pose = _offset_pose_z(
-            contact_left_pose,
-            float(_PRINGLES_RIGID_RAISE_Z_M),
-        )
-        raised_right_pose = _offset_pose_z(
-            contact_right_pose,
-            float(_PRINGLES_RIGID_RAISE_Z_M),
-        )
-        raised_q_goal = self._solve_dual_target_ik(
-            stage="pringles_rigid_raise",
-            left_pose=raised_left_pose,
-            right_pose=raised_right_pose,
-            q_start_cspace=contact_path[-1],
-            world_yml=motion_world_yml,
-        )
-        raised_plan, raised_path = self._plan_dual_target_rigid_tbrrt(
-            stage="pringles_rigid_raise",
-            q_start_cspace=contact_path[-1],
-            q_goal_cspace=raised_q_goal,
-            world_yml=motion_world_yml,
-        )
-        self._wait_for_both_arms(
-            stage="pringles_rigid_raise",
-            plan=raised_plan,
-            full_path=raised_path,
-            selected_arm="left",
-            other_arm="right",
-        )
-
-        final_left_pose = _copy_pose(raised_left_pose)
-        final_left_pose.position.x = float(_PRINGLES_FINAL_LEFT_X_M)
-        final_left_pose.position.y = float(_PRINGLES_FINAL_LEFT_Y_M)
-        final_left_pose.position.z = float(_PRINGLES_FINAL_LEFT_Z_M)
-        final_delta = (
-            float(final_left_pose.position.x) - float(raised_left_pose.position.x),
-            float(final_left_pose.position.y) - float(raised_left_pose.position.y),
-            float(final_left_pose.position.z) - float(raised_left_pose.position.z),
-        )
-        final_right_pose = _translated_pose(raised_right_pose, final_delta)
-        final_q_goal = self._solve_dual_target_ik(
-            stage="pringles_rigid_place",
-            left_pose=final_left_pose,
-            right_pose=final_right_pose,
-            q_start_cspace=raised_path[-1],
-            world_yml=motion_world_yml,
-        )
-        final_plan, final_path = self._plan_dual_target_rigid_tbrrt(
-            stage="pringles_rigid_place",
-            q_start_cspace=raised_path[-1],
-            q_goal_cspace=final_q_goal,
-            world_yml=motion_world_yml,
-        )
-        self._wait_for_both_arms(
-            stage="pringles_rigid_place",
-            plan=final_plan,
-            full_path=final_path,
-            selected_arm="left",
-            other_arm="right",
-        )
-
-        self.get_logger().info(
-            "[PRINGLES] sequence completed: "
-            f"selected_arm={normalize_arm_name(selected_arm)} "
-            f"object_center={[float(raw_object_center.x), float(raw_object_center.y), float(raw_object_center.z)]} "
-            f"object_size={_vector3_xyz(raw_object_size)} "
-            f"pregrasp_clearance_y={_PRINGLES_PREGRASP_CLEARANCE_Y_M:.3f} "
-            f"inward_y={_PRINGLES_INWARD_Y_M:.3f} "
-            f"side_grasp_z_offset={_PRINGLES_SIDE_GRASP_Z_OFFSET_M:.3f} "
-            f"left_align_orientation_xyzw={_pose_orientation_xyzw(pre_left_pose)} "
-            f"right_align_orientation_xyzw={_pose_orientation_xyzw(pre_right_pose)} "
-            f"object_collision_world_yml={object_world_yml} "
-            f"motion_world_yml={motion_world_yml} "
-            f"final_left={_pose_position_xyz(final_left_pose)}"
-        )
-        self._publish_finish_after_motion_complete(
-            selected_arm,
-            stage="pringles_grasp",
-            use_one_step_finish=use_one_step_finish_on_complete,
-        )
-
     def _execute_grasp_sequence(
         self,
         *,
         selected_arm: str,
         base_world_yml: str | None,
         shelf_type: str,
-        align_orientations: dict[str, Quaternion] | None = None,
-        use_pringles_sequence: bool = False,
         use_one_step_finish_on_complete: bool = False,
     ) -> None:
         shelf_type_key = str(shelf_type).strip().lower()
@@ -3325,20 +2771,12 @@ class ArmPickingCoordinator(Node):
                 )
                 object_size = _copy_vector3(grasp_msg.object_size)
                 object_label = str(getattr(grasp_msg, "label", "")).strip()
-                is_pringles_grasp = bool(use_pringles_sequence) or _is_pringles_msg(grasp_msg)
                 object_size.x = float(_GRASP_COLLISION_OBJECT_SIZE_X_M)
-                if is_pringles_grasp:
-                    object_size.y = max(
-                        float(_MIN_GRASP_COLLISION_OBJECT_SIZE_M),
-                        float(object_size.y)
-                        - float(_PRINGLES_COLLISION_OBJECT_SIZE_Y_OFFSET_M),
-                    )
-                else:
-                    object_size.y = (
-                        float(object_size.y)
-                        - float(_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M)
-                    )
-                if not is_pringles_grasp and _is_snack_grasp_msg(grasp_msg):
+                object_size.y = (
+                    float(object_size.y)
+                    - float(_GRASP_COLLISION_OBJECT_SIZE_Y_OFFSET_M)
+                )
+                if _is_snack_grasp_msg(grasp_msg):
                     object_size.y = float(_SNACK_COLLISION_OBJECT_SIZE_Y_M)
                 if is_shelf_1:
                     object_size.z = max(
@@ -3357,23 +2795,6 @@ class ArmPickingCoordinator(Node):
                     ),
                 )
                 _publish_world_collision_for_mujoco(self._args, object_world_yml)
-
-                if is_pringles_grasp:
-                    self.get_logger().info(
-                        "[PRINGLES] ObjectGrasp accepted; starting dual-arm pringles sequence: "
-                        f"label={object_label!r} selected_arm={normalize_arm_name(selected_arm)} "
-                        f"raw_object_size_y={float(grasp_msg.object_size.y):.3f} "
-                        f"collision_object_size_y={float(object_size.y):.3f}"
-                    )
-                    self._execute_pringles_grasp_sequence(
-                        selected_arm=selected_arm,
-                        grasp_msg=grasp_msg,
-                        object_world_yml=object_world_yml,
-                        motion_world_yml=base_world_yml,
-                        align_orientations=align_orientations,
-                        use_one_step_finish_on_complete=use_one_step_finish_on_complete,
-                    )
-                    return
 
                 grasp_selection, grasp_q_start_cspace = self._resolve_grasp_target_selection(
                     arm=selected_arm,
@@ -3634,21 +3055,10 @@ class ArmPickingCoordinator(Node):
             )
             self.get_logger().info("[ARM_PICKING] align sequence completed; waiting for ObjectGrasp")
             self._publish_finish_after_motion_complete(selected_arm, stage="align")
-            align_orientations = self._compute_dual_align_orientations(
-                q_cspace=full_path[-1],
-                world_yml=world_yml,
-            )
-            self.get_logger().info(
-                "[ARM_PICKING] captured per-arm align orientations: "
-                f"left={[float(align_orientations['left'].x), float(align_orientations['left'].y), float(align_orientations['left'].z), float(align_orientations['left'].w)]} "
-                f"right={[float(align_orientations['right'].x), float(align_orientations['right'].y), float(align_orientations['right'].z), float(align_orientations['right'].w)]}"
-            )
             self._execute_grasp_sequence(
                 selected_arm=selected_arm,
                 base_world_yml=world_yml,
                 shelf_type=sequence_shelf_type,
-                align_orientations=align_orientations,
-                use_pringles_sequence=_is_pringles_msg(msg),
                 use_one_step_finish_on_complete=shelf_1_single_left_align,
             )
         except Exception as exc:
@@ -3664,11 +3074,6 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
         default_collision_model="long_shelf",
     )
     parser.set_defaults(plot_path=False, arrival_max_retries=-1)
-    parser.add_argument(
-        "--urdf_path",
-        default=ROBOT_URDF,
-        help="URDF path used by dual-arm ForceCuroboIK scoring",
-    )
     parser.add_argument(
         "--arm_picking_start_topic",
         default="/arm_picking_start",
@@ -3708,37 +3113,6 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
         "--one_step_finish_topic",
         default="/one_step_finish",
         help="topic name used to publish shelf_1 completion before ARM_DOOR closes the door",
-    )
-    parser.add_argument(
-        "--force_ik_num_trials",
-        type=int,
-        default=_PRINGLES_FORCE_IK_NUM_TRIALS,
-        help="number of dual-arm IK trials used by the Pringles sequence",
-    )
-    parser.add_argument(
-        "--force_ik_num_seeds",
-        type=int,
-        default=_PRINGLES_FORCE_IK_NUM_SEEDS,
-        help="cuRobo IK internal seed count per arm for the Pringles sequence",
-    )
-    parser.add_argument(
-        "--force_ik_seed_noise_std",
-        type=float,
-        default=0.25,
-        help="stddev for Pringles dual-arm IK seed perturbation",
-    )
-    parser.add_argument(
-        "--force_ik_random_seed",
-        type=int,
-        default=0,
-        help="random seed used by the Pringles dual-arm IK search",
-    )
-    parser.add_argument(
-        "--forward_direction_base",
-        nargs=3,
-        type=float,
-        default=(1.0, 0.0, 0.0),
-        help="base-frame direction used by ForceCuroboIK scoring",
     )
     parser.add_argument(
         "--align_fixed_x_m",
