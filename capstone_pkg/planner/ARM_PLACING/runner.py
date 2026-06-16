@@ -20,12 +20,20 @@ from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 import yaml
+import torch
 
+from capstone_pkg.collision_check.collision import get_self_collision_checker
+from capstone_pkg.constraint_projection.constraint import build_bimanual_fk_robotworld
+from capstone_pkg.constraint_projection.projection import ManifoldProjectorTorch
 from capstone_pkg.kinematics.curobo_ik import (
+    FastBimanualIK,
     get_single_arm_ik,
+    solve_batch_bimanual,
     warmup_single_arm_ik_reachable,
 )
 from capstone_pkg.planner.arm_rrt_common.single_arm_motion import (
+    _build_ik_seed_batch,
+    _dedupe_q_candidates,
     build_active_joint_path,
     normalize_arm_name,
     plan_single_arm_motion,
@@ -35,7 +43,15 @@ from capstone_pkg.planner.arm_rrt_common.single_arm_runner import (
     build_single_arm_parser,
     build_single_arm_tbrrt_config,
 )
-from capstone_pkg.utils.config import CART_YAML, LEFT_JOINTS, RIGHT_JOINTS
+from capstone_pkg.planner.tbrrt.batch.conext import plan_tbrrt_extcon_batch_conext
+from capstone_pkg.utils.config import (
+    CART_YAML,
+    LEFT_EE_FRAME,
+    LEFT_JOINTS,
+    RIGHT_EE_FRAME,
+    RIGHT_JOINTS,
+)
+from capstone_pkg.utils.joint_limit import load_joint_limits_torch
 from capstone_pkg.utils.world_collision_bridge import (
     WorldCuboid,
     make_world_collision_payload,
@@ -55,6 +71,10 @@ _ARM_TARGETS = {
 }
 _CSPACE_JOINT_NAMES = list(LEFT_JOINTS) + list(RIGHT_JOINTS)
 _SIM_GRIPPER_JOINT_NAMES = ["gripper_l_joint1", "gripper_r_joint1"]
+_BIMANUAL_NONZERO_TOL = 1.0e-4
+_BIMANUAL_PLACE_LOWER_Z_M = 1.1
+_BIMANUAL_PLACE_SPREAD_Y_M = 0.05
+_BIMANUAL_PLACE_FINAL_Z_M = 1.3
 
 
 def _duration_from_seconds(seconds: float) -> Duration:
@@ -148,6 +168,105 @@ def _pose_position_xyz(pose: Pose) -> list[float]:
         float(pose.position.y),
         float(pose.position.z),
     ]
+
+
+def _pose_orientation_wxyz(pose: Pose) -> list[float]:
+    return [
+        float(pose.orientation.w),
+        float(pose.orientation.x),
+        float(pose.orientation.y),
+        float(pose.orientation.z),
+    ]
+
+
+def _quat_conj_wxyz_torch(q: torch.Tensor) -> torch.Tensor:
+    out = q.clone()
+    out[..., 1:4] = -out[..., 1:4]
+    return out
+
+
+def _quat_mul_wxyz_torch(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    aw, ax, ay, az = a.unbind(dim=-1)
+    bw, bx, by, bz = b.unbind(dim=-1)
+    return torch.stack(
+        (
+            (aw * bw) - (ax * bx) - (ay * by) - (az * bz),
+            (aw * bx) + (ax * bw) + (ay * bz) - (az * by),
+            (aw * by) - (ax * bz) + (ay * bw) + (az * bx),
+            (aw * bz) + (ax * by) - (ay * bx) + (az * bw),
+        ),
+        dim=-1,
+    )
+
+
+class BimanualFixedOrientationConstraint:
+    def __init__(
+        self,
+        *,
+        robot_yml: str,
+        q_ref: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> None:
+        if q_ref.ndim != 1:
+            raise ValueError("q_ref must be (D,)")
+        self.device = device
+        self.dtype = dtype
+        self.fk = build_bimanual_fk_robotworld(
+            robot_yml=robot_yml,
+            left_ee=LEFT_EE_FRAME,
+            right_ee=RIGHT_EE_FRAME,
+            device=device,
+            dtype=dtype,
+        )
+        with torch.no_grad():
+            q0 = q_ref.to(device=device, dtype=dtype).view(1, -1)
+            _p_l, q_l, _p_r, q_r = self.fk.fk_lr_pose(q0)
+            self.q_l_ref = q_l.squeeze(0).detach().clone().contiguous()
+            self.q_r_ref = q_r.squeeze(0).detach().clone().contiguous()
+
+    @torch.no_grad()
+    def h(self, q: torch.Tensor) -> torch.Tensor:
+        if q.ndim == 1:
+            q = q.view(1, -1)
+        _p_l, q_l, _p_r, q_r = self.fk.fk_lr_pose(
+            q.to(device=self.device, dtype=self.dtype)
+        )
+        q_l_ref = self.q_l_ref.view(1, 4).expand_as(q_l)
+        q_r_ref = self.q_r_ref.view(1, 4).expand_as(q_r)
+        q_l_err = _quat_mul_wxyz_torch(_quat_conj_wxyz_torch(q_l_ref), q_l)
+        q_r_err = _quat_mul_wxyz_torch(_quat_conj_wxyz_torch(q_r_ref), q_r)
+        q_l_err = q_l_err * (
+            1.0 - 2.0 * (q_l_err[..., 0:1] < 0.0).to(q_l_err.dtype)
+        )
+        q_r_err = q_r_err * (
+            1.0 - 2.0 * (q_r_err[..., 0:1] < 0.0).to(q_r_err.dtype)
+        )
+        return torch.cat((2.0 * q_l_err[..., 1:4], 2.0 * q_r_err[..., 1:4]), dim=-1)
+
+    @torch.no_grad()
+    def residual_torch(self, q: torch.Tensor) -> torch.Tensor:
+        return self.h(q)
+
+    @torch.no_grad()
+    def residual_and_jacobian_torch(self, q: torch.Tensor):
+        return None
+
+    @torch.no_grad()
+    def jacobian_torch(self, q: torch.Tensor):
+        return None
+
+    @torch.no_grad()
+    def jacobian(self, q: torch.Tensor):
+        return None
+
+    @torch.no_grad()
+    def residual(self, q: torch.Tensor) -> torch.Tensor:
+        return self.h(q)
+
+    @torch.no_grad()
+    def residual_norm(self, q: torch.Tensor) -> torch.Tensor:
+        return torch.linalg.norm(self.h(q), dim=-1)
 
 
 def _cart_local_origin_x(cuboids: Sequence[WorldCuboid]) -> float:
@@ -415,6 +534,22 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--gripper_duration_s", type=float, default=1.0)
     ap.add_argument("--gripper_open_wait_s", type=float, default=1.2)
     ap.add_argument("--final_arm_target_z_m", type=float, default=1.3)
+    ap.add_argument("--bimanual_nonzero_tol", type=float, default=_BIMANUAL_NONZERO_TOL)
+    ap.add_argument(
+        "--bimanual_place_lower_z_m",
+        type=float,
+        default=_BIMANUAL_PLACE_LOWER_Z_M,
+    )
+    ap.add_argument(
+        "--bimanual_place_spread_y_m",
+        type=float,
+        default=_BIMANUAL_PLACE_SPREAD_Y_M,
+    )
+    ap.add_argument(
+        "--bimanual_place_final_z_m",
+        type=float,
+        default=_BIMANUAL_PLACE_FINAL_Z_M,
+    )
     ap.add_argument(
         "--arrival_progress_check_s",
         type=float,
@@ -903,16 +1038,393 @@ class ArmPlacingNode(Node):
 
         raise RuntimeError("rclpy shutdown while waiting for joint arrival")
 
+    def _arm_has_nonzero_joint(
+        self,
+        q_cspace: Sequence[float],
+        arm: str,
+        *,
+        tol: float,
+    ) -> bool:
+        values = _extract_joint_positions(
+            q_cspace,
+            _CSPACE_JOINT_NAMES,
+            _arm_joint_names(normalize_arm_name(arm)),
+        )
+        return any(_wrapped_joint_delta(float(v), 0.0) > float(tol) for v in values)
+
+    def _both_arms_have_nonzero_joints(self, q_cspace: Sequence[float]) -> bool:
+        tol = float(getattr(self._args, "bimanual_nonzero_tol", _BIMANUAL_NONZERO_TOL))
+        return self._arm_has_nonzero_joint(
+            q_cspace,
+            "left",
+            tol=tol,
+        ) and self._arm_has_nonzero_joint(
+            q_cspace,
+            "right",
+            tol=tol,
+        )
+
+    def _fk_arm_pose_from_q(
+        self,
+        arm: str,
+        q_cspace: Sequence[float],
+        *,
+        world_yml: str | None,
+    ) -> Pose:
+        normalized_arm = normalize_arm_name(arm)
+        ik = get_single_arm_ik(
+            str(self._args.robot_yml),
+            arm=normalized_arm,
+            cpu=bool(self._args.cpu),
+            world_yml=world_yml,
+        )
+        q_active = _extract_joint_positions(
+            q_cspace,
+            ik.cspace_joint_names,
+            ik.active_joint_names,
+        )
+        kin = ik.solver.fk(
+            torch.tensor(
+                [q_active],
+                device=ik.device,
+                dtype=torch.float32,
+            )
+        )
+        pos = [float(v) for v in kin.ee_position[0].detach().cpu().tolist()]
+        quat_wxyz = [float(v) for v in kin.ee_quaternion[0].detach().cpu().tolist()]
+        pose = Pose()
+        pose.position.x = pos[0]
+        pose.position.y = pos[1]
+        pose.position.z = pos[2]
+        pose.orientation.w = quat_wxyz[0]
+        pose.orientation.x = quat_wxyz[1]
+        pose.orientation.y = quat_wxyz[2]
+        pose.orientation.z = quat_wxyz[3]
+        return pose
+
+    def _solve_bimanual_goal_ik(
+        self,
+        *,
+        stage: str,
+        left_pose: Pose,
+        right_pose: Pose,
+        q_start_cspace: Sequence[float],
+        world_yml: str | None,
+    ) -> list[float]:
+        q_start = [float(v) for v in q_start_cspace]
+        joint_limits = load_joint_limits_torch(
+            str(self._args.joint_limit_yml),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        seed_batch = _build_ik_seed_batch(
+            q_start,
+            batch_size=max(1, int(self._args.ik_batch)),
+            noise_std=float(self._args.ik_seed_noise_std),
+            random_seed=int(self._args.ik_seed),
+            lower=joint_limits.lower.detach().cpu().numpy(),
+            upper=joint_limits.upper.detach().cpu().numpy(),
+        )
+        solver = FastBimanualIK(
+            str(self._args.robot_yml),
+            cpu=bool(self._args.cpu),
+            num_seeds=max(1, min(20, int(self._args.ik_batch))),
+            use_cuda_graph=False,
+            world_yml=world_yml,
+        )
+        outs = solve_batch_bimanual(
+            solver,
+            [_pose_position_xyz(left_pose) for _ in range(len(seed_batch))],
+            [_pose_orientation_wxyz(left_pose) for _ in range(len(seed_batch))],
+            [_pose_position_xyz(right_pose) for _ in range(len(seed_batch))],
+            [_pose_orientation_wxyz(right_pose) for _ in range(len(seed_batch))],
+            q_start_cspace=q_start,
+            q_seed_cspace_batch=seed_batch,
+            parallel_cuda_streams=True,
+        )
+        candidates = [
+            list(out.q_cspace)
+            for out in outs
+            if out.success and out.q_cspace is not None
+        ]
+        candidates = _dedupe_q_candidates(
+            candidates,
+            atol=float(self._args.ik_goal_dedupe_tol),
+        )
+        checker = get_self_collision_checker(
+            str(self._args.robot_yml),
+            cpu=bool(self._args.cpu),
+            world_yml=world_yml,
+        )
+        free_candidates: list[list[float]] = []
+        for q in candidates:
+            in_collision, _d_self, _d_world = checker.check_single(q)
+            if not in_collision:
+                free_candidates.append([float(v) for v in q])
+        if not free_candidates:
+            raise RuntimeError(
+                f"bimanual IK failed for {stage}: "
+                f"raw_candidates={len(candidates)} collision_free=0"
+            )
+
+        best = min(
+            free_candidates,
+            key=lambda q: sum(
+                _wrapped_joint_delta(float(a), float(b))
+                for a, b in zip(q, q_start)
+            ),
+        )
+        self.get_logger().info(
+            "[BIMANUAL_PLACING] IK success: "
+            f"stage={stage} raw={len(candidates)} free={len(free_candidates)} "
+            f"left_xyz={_pose_position_xyz(left_pose)} right_xyz={_pose_position_xyz(right_pose)}"
+        )
+        return [float(v) for v in best]
+
+    def _plan_bimanual_fixed_orientation_path(
+        self,
+        *,
+        stage: str,
+        q_start_cspace: Sequence[float],
+        q_goal_cspace: Sequence[float],
+        world_yml: str | None,
+    ) -> list[list[float]]:
+        checker = get_self_collision_checker(
+            str(self._args.robot_yml),
+            cpu=bool(self._args.cpu),
+            world_yml=world_yml,
+        )
+        device = checker.tensor_args.device
+        dtype = torch.float32
+        q_start = [float(v) for v in q_start_cspace]
+        constraint = BimanualFixedOrientationConstraint(
+            robot_yml=str(self._args.robot_yml),
+            q_ref=torch.tensor(q_start, device=device, dtype=dtype),
+            device=device,
+            dtype=dtype,
+        )
+        joint_limits = load_joint_limits_torch(
+            str(self._args.joint_limit_yml),
+            device=device,
+            dtype=dtype,
+        )
+        projector = ManifoldProjectorTorch(
+            constraint=constraint,
+            limits=joint_limits,
+            max_iters=60,
+            tol=1.0e-3,
+            fd_eps=1.0e-3,
+            damping=0.0,
+            step_size=1.0,
+        )
+        t_start = time.perf_counter()
+        out = plan_tbrrt_extcon_batch_conext(
+            q_start=q_start,
+            q_goals=[[float(v) for v in q_goal_cspace]],
+            cfg=build_single_arm_tbrrt_config(self._args),
+            checker=checker,
+            projector=projector,
+            joint_limits=joint_limits,
+            device=device,
+            block_K=int(self._args.tbrrt_block_k),
+        )
+        if not out.success or not out.path:
+            raise RuntimeError(
+                f"bimanual fixed-orientation TBRRT failed for {stage}: "
+                f"{out.stats.extra}"
+            )
+        path = [[float(v) for v in q] for q in out.path]
+        self.get_logger().info(
+            "[BIMANUAL_PLACING] batch TBRRT success: "
+            f"stage={stage} waypoints={len(path)} "
+            f"planning_time={time.perf_counter() - t_start:.3f}s stats={out.stats.extra}"
+        )
+        return path
+
+    def _publish_bimanual_path(self, full_path: Sequence[Sequence[float]]) -> None:
+        if str(self._args.publish_mode) != "real":
+            self._publish_joint_state_path(
+                topic=str(self._args.publish_topic),
+                joint_names=_CSPACE_JOINT_NAMES,
+                path=full_path,
+                dt=float(self._args.publish_dt),
+            )
+            return
+
+        name_to_idx = {name: idx for idx, name in enumerate(_CSPACE_JOINT_NAMES)}
+        left_idx = [name_to_idx[name] for name in LEFT_JOINTS]
+        right_idx = [name_to_idx[name] for name in RIGHT_JOINTS]
+        left_path = [[float(q[idx]) for idx in left_idx] for q in full_path]
+        right_path = [[float(q[idx]) for idx in right_idx] for q in full_path]
+        left_topic = str(self._args.real_left_topic)
+        right_topic = str(self._args.real_right_topic)
+        left_pub = self._get_traj_publisher(left_topic)
+        right_pub = self._get_traj_publisher(right_topic)
+        self._wait_for_publisher_match(
+            left_pub,
+            left_topic,
+            wait_subscriber_s=float(self._args.publish_wait_subscriber_s),
+        )
+        self._wait_for_publisher_match(
+            right_pub,
+            right_topic,
+            wait_subscriber_s=float(self._args.publish_wait_subscriber_s),
+        )
+        left_msg = _build_joint_trajectory(
+            left_path,
+            LEFT_JOINTS,
+            dt=float(self._args.publish_dt),
+        )
+        right_msg = _build_joint_trajectory(
+            right_path,
+            RIGHT_JOINTS,
+            dt=float(self._args.publish_dt),
+        )
+        stamp = (
+            self.get_clock().now()
+            + RclpyDuration(seconds=float(getattr(self._args, "start_delay_s", 0.2)))
+        ).to_msg()
+        left_msg.header.stamp = stamp
+        right_msg.header.stamp = stamp
+        repeats = max(1, int(self._args.publish_repeat))
+        for idx in range(repeats):
+            left_pub.publish(left_msg)
+            right_pub.publish(right_msg)
+            if idx + 1 < repeats:
+                time.sleep(max(0.0, float(self._args.publish_period_s)))
+        if float(self._args.publish_keep_alive_s) > 0.0:
+            time.sleep(float(self._args.publish_keep_alive_s))
+
+    def _execute_bimanual_path(self, *, stage: str, full_path: Sequence[Sequence[float]]) -> None:
+        goal = [float(v) for v in full_path[-1]]
+        max_attempts = _retry_attempt_limit(
+            int(getattr(self._args, "arrival_max_retries", -1))
+        )
+        attempt_idx = 0
+        last_err = float("inf")
+        while max_attempts is None or attempt_idx < max_attempts:
+            self.get_logger().info(
+                "[BIMANUAL_PLACING] publishing path: "
+                f"stage={stage} waypoints={len(full_path)} "
+                f"attempt={_format_attempt(attempt_idx, max_attempts)}"
+            )
+            self._publish_bimanual_path(full_path)
+            wait_s = _resolve_arrival_wait_s(
+                path_len=len(full_path),
+                dt=float(self._args.publish_dt),
+                configured_wait_s=float(getattr(self._args, "arrival_wait_s", -1.0)),
+            )
+            arrival_status, _current, max_abs_err, stalled_for_s = (
+                self._wait_until_joint_positions_or_stall(
+                    _CSPACE_JOINT_NAMES,
+                    goal,
+                    wait_s=wait_s,
+                    tolerance=float(getattr(self._args, "arrival_joint_tolerance", 0.05)),
+                    poll_period_s=float(getattr(self._args, "arrival_poll_s", 0.05)),
+                    stall_timeout_s=float(getattr(self._args, "arrival_stall_timeout_s", 1.0)),
+                    stall_tolerance=float(getattr(self._args, "arrival_stall_tolerance", 0.005)),
+                )
+            )
+            if arrival_status == "arrived":
+                return
+            last_err = max_abs_err
+            attempt_idx += 1
+            self.get_logger().warning(
+                "[BIMANUAL_PLACING] arrival not confirmed: "
+                f"stage={stage} status={arrival_status} max_abs_err={max_abs_err:.6f} "
+                f"stalled_for={stalled_for_s:.2f}s; retrying"
+            )
+        raise RuntimeError(
+            f"Failed to confirm bimanual path arrival for {stage}; "
+            f"last max_abs_err={last_err:.6f}"
+        )
+
+    def _run_bimanual_nonzero_sequence(
+        self,
+        q_start_cspace: Sequence[float],
+        *,
+        world_yml: str,
+    ) -> None:
+        left_pose = self._fk_arm_pose_from_q("left", q_start_cspace, world_yml=world_yml)
+        right_pose = self._fk_arm_pose_from_q("right", q_start_cspace, world_yml=world_yml)
+        lower_z = float(
+            getattr(self._args, "bimanual_place_lower_z_m", _BIMANUAL_PLACE_LOWER_Z_M)
+        )
+        spread_y = float(
+            getattr(self._args, "bimanual_place_spread_y_m", _BIMANUAL_PLACE_SPREAD_Y_M)
+        )
+        final_z = float(
+            getattr(self._args, "bimanual_place_final_z_m", _BIMANUAL_PLACE_FINAL_Z_M)
+        )
+
+        stages: list[tuple[str, Pose, Pose]] = []
+        z_pose_l = _copy_pose(left_pose)
+        z_pose_r = _copy_pose(right_pose)
+        z_pose_l.position.z = lower_z
+        z_pose_r.position.z = lower_z
+        stages.append(("bimanual_z_1p1", z_pose_l, z_pose_r))
+
+        spread_pose_l = _copy_pose(z_pose_l)
+        spread_pose_r = _copy_pose(z_pose_r)
+        spread_pose_l.position.y = float(spread_pose_l.position.y) + spread_y
+        spread_pose_r.position.y = float(spread_pose_r.position.y) - spread_y
+        stages.append(("bimanual_spread_y", spread_pose_l, spread_pose_r))
+
+        final_pose_l = _copy_pose(spread_pose_l)
+        final_pose_r = _copy_pose(spread_pose_r)
+        final_pose_l.position.z = final_z
+        final_pose_r.position.z = final_z
+        stages.append(("bimanual_z_1p3", final_pose_l, final_pose_r))
+
+        q_current = [float(v) for v in q_start_cspace]
+        for stage, target_left, target_right in stages:
+            q_goal = self._solve_bimanual_goal_ik(
+                stage=stage,
+                left_pose=target_left,
+                right_pose=target_right,
+                q_start_cspace=q_current,
+                world_yml=world_yml,
+            )
+            path = self._plan_bimanual_fixed_orientation_path(
+                stage=stage,
+                q_start_cspace=q_current,
+                q_goal_cspace=q_goal,
+                world_yml=world_yml,
+            )
+            self._execute_bimanual_path(stage=stage, full_path=path)
+            q_current = [float(v) for v in path[-1]]
+
+        self.get_logger().info(
+            "[BIMANUAL_PLACING] completed without lift: "
+            f"lower_z={lower_z:.3f} spread_y={spread_y:.3f} final_z={final_z:.3f}"
+        )
+
     def _process_request(self, arm: str) -> None:
         try:
-            initial_arm_pose = self._read_current_arm_pose(arm)
-            initial_lift_position = self._read_current_lift_position()
-
             self.get_logger().info("Step 2: spawn cart collision model")
             self._publish_cart_collision_world(
                 str(self._active_cart_world_yml),
                 label="cart collision spawn",
             )
+
+            q_start_cspace = self._wait_for_joint_sample(
+                _CSPACE_JOINT_NAMES,
+                wait_s=float(self._args.joint_state_wait_s),
+            )
+            if self._both_arms_have_nonzero_joints(q_start_cspace):
+                self.get_logger().info(
+                    "Detected non-zero joints on both arms; running bimanual placing "
+                    "sequence with fixed orientation and no lift"
+                )
+                self._run_bimanual_nonzero_sequence(
+                    q_start_cspace,
+                    world_yml=str(self._active_cart_world_yml),
+                )
+                self._open_grippers()
+                self._publish_finish()
+                return
+
+            initial_lift_position = self._read_current_lift_position()
 
             placing_target_pose = self._build_arm_target_pose(arm)
             self.get_logger().info(
