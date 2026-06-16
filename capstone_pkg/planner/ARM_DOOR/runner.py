@@ -441,7 +441,7 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--post_open_ingress_distance_m",
         type=float,
-        default=0.40,
+        default=0.50,
         help="base body-x distance to drive inward after the right arm is zeroed",
     )
     ap.add_argument(
@@ -455,6 +455,18 @@ def _build_arm_door_parser():
         type=float,
         default=0.10,
         help="base body-x speed for the post-open inward drive",
+    )
+    ap.add_argument(
+        "--post_open_final_lateral_distance_m",
+        type=float,
+        default=-0.15,
+        help="base body-y distance to move after the post-open inward drive",
+    )
+    ap.add_argument(
+        "--post_open_final_lateral_speed_mps",
+        type=float,
+        default=0.10,
+        help="base body-y speed for the post-open lateral move after ingress",
     )
     ap.add_argument(
         "--door_open_base_publish_interp",
@@ -754,14 +766,101 @@ def _publish_real_path(args, arm: str, joint_names, path, *, dt_override: float 
     )
 
 
-def _publish_reach_path_with_left_zero(args, arm: str, joint_names, path) -> None:
+def _pad_joint_path_to_length(
+    path: Sequence[Sequence[float]],
+    length: int,
+) -> list[list[float]]:
+    if not path:
+        raise RuntimeError("cannot pad an empty joint path")
+    out = [[float(v) for v in q] for q in path]
+    while len(out) < int(length):
+        out.append(list(out[-1]))
+    return out
+
+
+def _plan_left_arm_zero_for_reach(
+    args,
+    *,
+    cspace_joint_names: Sequence[str],
+    q_start_cspace: Sequence[float],
+    world_yml: str | None,
+) -> tuple[list[str], list[list[float]]]:
+    from capstone_pkg.planner.arm_rrt_common.single_arm_runner import (
+        build_single_arm_tbrrt_config,
+    )
+    from capstone_pkg.planner.tbrrt.batch.single_arm_batch_conext import (
+        plan_single_arm_tbrrt_batch_conext,
+    )
+    from capstone_pkg.utils.config import LEFT_JOINTS
+
+    left_joint_names = [str(name) for name in LEFT_JOINTS]
+    cspace_names = [str(name) for name in cspace_joint_names]
+    q_start = [float(v) for v in q_start_cspace]
+    if len(cspace_names) != len(q_start):
+        raise RuntimeError("left zero planning cspace names and start state length mismatch")
+
+    q_goal = _build_arm_zero_goal_cspace(
+        q_start_cspace=q_start,
+        cspace_joint_names=cspace_names,
+        active_joint_names=left_joint_names,
+    )
+    left_idx = {
+        name: cspace_names.index(name)
+        for name in left_joint_names
+        if name in cspace_names
+    }
+    if len(left_idx) != len(left_joint_names):
+        missing = [name for name in left_joint_names if name not in left_idx]
+        raise RuntimeError(f"Missing left joints in cspace state: {missing}")
+
+    if all(abs(q_start[left_idx[name]]) <= 1.0e-4 for name in left_joint_names):
+        print("[ARM_DOOR][LEFT_ARM_ZERO] left arm already at zero; sending hold command")
+        return left_joint_names, [[0.0 for _ in left_joint_names]]
+
+    print("[ARM_DOOR][LEFT_ARM_ZERO] planning left arm path to zero joints")
+    t_start = time.perf_counter()
+    out = plan_single_arm_tbrrt_batch_conext(
+        robot_yml=str(args.robot_yml),
+        arm="left",
+        q_start=q_start,
+        q_goals=[q_goal],
+        world_yml=world_yml,
+        cpu=bool(args.cpu),
+        cfg=build_single_arm_tbrrt_config(args),
+        joint_limit_yml=str(args.joint_limit_yml),
+        block_k=int(args.tbrrt_block_k),
+    )
+    if not out.success or not out.path:
+        raise RuntimeError(f"Failed to plan left arm zero path: {out.stats.extra}")
+
+    _, left_path = _active_path_from_cspace(
+        cspace_names,
+        left_joint_names,
+        [[float(v) for v in q] for q in out.path],
+    )
+    print(
+        "[ARM_DOOR][LEFT_ARM_ZERO] planned "
+        f"waypoints={len(left_path)} planning_time={time.perf_counter() - t_start:.3f}s"
+    )
+    return left_joint_names, left_path
+
+
+def _publish_reach_path_with_left_zero(
+    args,
+    arm: str,
+    joint_names,
+    path,
+    *,
+    cspace_joint_names: Sequence[str] | None = None,
+    q_start_cspace: Sequence[float] | None = None,
+    world_yml: str | None = None,
+) -> int:
     from capstone_pkg.planner.arm_rrt_common.path_publisher import (
         JointTrajectoryCommand,
         publish_joint_path,
         publish_joint_trajectory_group,
         send_joint_trajectory_action_group,
     )
-    from capstone_pkg.utils.config import LEFT_JOINTS
 
     normalized_arm = str(arm).strip().lower()
     if normalized_arm != "right":
@@ -775,15 +874,23 @@ def _publish_reach_path_with_left_zero(args, arm: str, joint_names, path) -> Non
                 dt=float(args.publish_dt),
                 wait_subscriber_s=float(args.publish_wait_subscriber_s),
             )
-        return
+        return len(path)
 
     right_joint_names = [str(name) for name in joint_names]
     right_path = [[float(v) for v in q] for q in path]
-    left_joint_names = [str(name) for name in LEFT_JOINTS]
-    left_zero_path = [
-        [0.0 for _ in left_joint_names]
-        for _ in right_path
-    ]
+    if cspace_joint_names is None or q_start_cspace is None:
+        raise RuntimeError(
+            "right-arm reach publishing requires cspace start state for left zero planning"
+        )
+    left_joint_names, left_zero_path = _plan_left_arm_zero_for_reach(
+        args,
+        cspace_joint_names=cspace_joint_names,
+        q_start_cspace=q_start_cspace,
+        world_yml=world_yml,
+    )
+    sync_len = max(len(left_zero_path), len(right_path))
+    left_zero_path = _pad_joint_path_to_length(left_zero_path, sync_len)
+    right_path = _pad_joint_path_to_length(right_path, sync_len)
 
     if args.publish_mode == "real":
         action_commands = [
@@ -827,7 +934,7 @@ def _publish_reach_path_with_left_zero(args, arm: str, joint_names, path) -> Non
                     wait_result_s=args.action_wait_result_s,
                     start_time_delay_s=float(getattr(args, "start_delay_s", 0.2)),
                 )
-                return
+                return sync_len
             except RuntimeError as exc:
                 print(f"[PUBLISH][ACTION] {exc}")
                 if not args.real_action_fallback_to_topic:
@@ -857,7 +964,7 @@ def _publish_reach_path_with_left_zero(args, arm: str, joint_names, path) -> Non
             start_time_delay_s=float(getattr(args, "start_delay_s", 0.2)),
             zero_header_stamp=bool(getattr(args, "real_zero_trajectory_stamp", True)),
         )
-        return
+        return sync_len
 
     combined_joint_names = left_joint_names + right_joint_names
     combined_path = [
@@ -865,7 +972,8 @@ def _publish_reach_path_with_left_zero(args, arm: str, joint_names, path) -> Non
         for left_q, right_q in zip(left_zero_path, right_path)
     ]
     print(
-        f"[ARM_DOOR] Publishing reach JointState path with left arm zero -> {args.publish_topic} "
+        "[ARM_DOOR] Publishing reach JointState path with left arm zero -> "
+        f"{args.publish_topic} "
         f"(dt={float(args.publish_dt):.3f}s)"
     )
     publish_joint_path(
@@ -875,6 +983,7 @@ def _publish_reach_path_with_left_zero(args, arm: str, joint_names, path) -> Non
         dt=float(args.publish_dt),
         wait_subscriber_s=float(args.publish_wait_subscriber_s),
     )
+    return sync_len
 
 
 def _publish_gripper_target(args, arm: str, target: float, *, label: str) -> None:
@@ -1317,10 +1426,18 @@ def _run_post_open_release_retreat_zero_ingress(
     _publish_base_body_move(
         args,
         axis="x",
-        distance_m=float(getattr(args, "post_open_ingress_distance_m", 0.40)),
+        distance_m=float(getattr(args, "post_open_ingress_distance_m", 0.50)),
         speed_mps=float(getattr(args, "post_open_ingress_speed_mps", 0.10)),
         label="ingress",
         yaw_delta_deg=float(getattr(args, "post_open_ingress_yaw_deg", -10.0)),
+    )
+
+    _publish_base_body_move(
+        args,
+        axis="y",
+        distance_m=float(getattr(args, "post_open_final_lateral_distance_m", -0.15)),
+        speed_mps=float(getattr(args, "post_open_final_lateral_speed_mps", 0.10)),
+        label="final_lateral",
     )
 
 
@@ -4594,7 +4711,15 @@ def _run_arm_door_sequence(args: argparse.Namespace) -> int:
 
     if args.publish_path:
         try:
-            _publish_reach_path_with_left_zero(args, arm, active_joint_names, active_path)
+            reach_publish_len = _publish_reach_path_with_left_zero(
+                args,
+                arm,
+                active_joint_names,
+                active_path,
+                cspace_joint_names=plan.cspace_joint_names,
+                q_start_cspace=plan.q_start_cspace,
+                world_yml=resolved_world_yml,
+            )
         except RuntimeError as exc:
             print(f"[ARM_DOOR][PUBLISH] {exc}")
             return 1
@@ -4602,7 +4727,10 @@ def _run_arm_door_sequence(args: argparse.Namespace) -> int:
 
         if args.close_gripper_after_path:
             if args.publish_mode == "real" and not args.real_use_action:
-                traj_duration_s = max(0.0, float(len(active_path) - 1) * float(args.publish_dt))
+                traj_duration_s = max(
+                    0.0,
+                    float(reach_publish_len - 1) * float(args.publish_dt),
+                )
                 if traj_duration_s > 0.0:
                     print(
                         f"[ARM_DOOR][GRIPPER] Waiting for arm trajectory: "
