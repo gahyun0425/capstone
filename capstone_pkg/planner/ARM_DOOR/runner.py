@@ -459,7 +459,7 @@ def _build_arm_door_parser():
     ap.add_argument(
         "--post_open_final_lateral_distance_m",
         type=float,
-        default=-0.15,
+        default=-0.30,
         help="base body-y distance to move after the post-open inward drive",
     )
     ap.add_argument(
