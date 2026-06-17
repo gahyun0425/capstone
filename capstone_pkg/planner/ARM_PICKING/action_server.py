@@ -6,7 +6,7 @@ import math
 import tempfile
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Sequence
 
@@ -114,6 +114,16 @@ _SNACK_FALLBACK_Y_OFFSET_M = 0.02
 _SNACK_FALLBACK_Z_OFFSET_M = 0.02
 _SNACK_FALLBACK_YAW_OFFSET_RAD = -0.5 * math.pi
 _SNACK_COLLISION_OBJECT_SIZE_Y_M = 0.08
+_PRINGLES_DUAL_ALIGN_Y_SEPARATION_M = 0.50
+_PRINGLES_DUAL_GRASP_SIDE_CLEARANCE_M = 0.05
+_PRINGLES_DUAL_GRASP_X_OFFSET_M = 0.01
+_PRINGLES_DUAL_GRASP_Z_OFFSET_M = 0.01
+_PRINGLES_DUAL_GRASP_INWARD_Y_M = 0.06
+_PRINGLES_DUAL_GRASP_LIFT_Z_M = 0.03
+_PRINGLES_DUAL_EXTRACT_LEFT_XYZ_M = (0.40, 0.16, 1.40)
+_PRINGLES_DUAL_EXTRACT_SEGMENTS = 8
+_PRINGLES_DUAL_EXTRACT_TBRRT_BLOCK_K = 128
+_PRINGLES_DUAL_EXTRACT_TBRRT_TIME_LIMIT_S = 180.0
 _GRASP_IK_CANDIDATE_BATCH_SIZE = 3
 _GRASP_FALLBACK_Z_OFFSET_M = 0.02
 _GRASP_FALLBACK_X_OFFSET_M = -0.0
@@ -424,6 +434,101 @@ def _is_snack_grasp_msg(msg: ObjectGrasp) -> bool:
     return "과자" in label or label_lower in {"snack", "snacks"}
 
 
+def _is_pringles_align_msg(msg: ObjectAlign) -> bool:
+    for field_name in ("label", "text_prompt"):
+        value = str(getattr(msg, field_name, "")).strip().lower()
+        if "pringles" in value or "프링글" in value:
+            return True
+    return False
+
+
+def _is_pringles_grasp_msg(msg: ObjectGrasp) -> bool:
+    value = str(getattr(msg, "label", "")).strip().lower()
+    return "pringles" in value or "프링글" in value
+
+
+def _other_arm_align_y_offset_m(selected_arm: str, separation_m: float) -> float:
+    return (
+        -float(separation_m)
+        if normalize_arm_name(selected_arm) == "left"
+        else float(separation_m)
+    )
+
+
+def _build_other_arm_offset_align_target_pose(
+    msg: ObjectAlign,
+    *,
+    selected_arm: str,
+    other_arm: str,
+    selected_target_pose: Pose,
+    y_separation_m: float,
+    fixed_x_m: float,
+    lift_z_m: float,
+) -> Pose:
+    pose = _build_align_target_pose(
+        msg,
+        selected_arm=other_arm,
+        fixed_x_m=float(fixed_x_m),
+        lift_z_m=float(lift_z_m),
+    )
+    pose.position.x = float(selected_target_pose.position.x)
+    pose.position.y = (
+        float(selected_target_pose.position.y)
+        + _other_arm_align_y_offset_m(selected_arm, float(y_separation_m))
+    )
+    pose.position.z = float(selected_target_pose.position.z)
+    return pose
+
+
+def _build_pringles_dual_grasp_target_poses(
+    msg: ObjectGrasp,
+    *,
+    side_clearance_m: float,
+    x_offset_m: float,
+    z_offset_m: float,
+) -> tuple[Pose, Pose]:
+    center = msg.object_pose.position
+    size_y = float(msg.object_size.y)
+    half_size_y = 0.5 * float(size_y)
+
+    left_pose = Pose()
+    left_pose.position.x = float(center.x) + float(x_offset_m)
+    left_pose.position.y = float(center.y) + half_size_y + float(side_clearance_m)
+    left_pose.position.z = float(center.z) + float(z_offset_m)
+    left_pose.orientation = _normalize_orientation(
+        Quaternion(
+            x=float(_LEFT_SHELF_2_ALIGN_QUATERNION_XYZW[0]),
+            y=float(_LEFT_SHELF_2_ALIGN_QUATERNION_XYZW[1]),
+            z=float(_LEFT_SHELF_2_ALIGN_QUATERNION_XYZW[2]),
+            w=float(_LEFT_SHELF_2_ALIGN_QUATERNION_XYZW[3]),
+        )
+    )
+
+    right_pose = Pose()
+    right_pose.position.x = float(center.x) + float(x_offset_m)
+    right_pose.position.y = float(center.y) - half_size_y - float(side_clearance_m)
+    right_pose.position.z = float(center.z) + float(z_offset_m)
+    right_pose.orientation = _normalize_orientation(
+        Quaternion(
+            x=float(_FIXED_ALIGN_QUATERNION_XYZW[0]),
+            y=float(_FIXED_ALIGN_QUATERNION_XYZW[1]),
+            z=float(_FIXED_ALIGN_QUATERNION_XYZW[2]),
+            w=float(_FIXED_ALIGN_QUATERNION_XYZW[3]),
+        )
+    )
+
+    return left_pose, right_pose
+
+
+def _offset_pringles_inward_pose(arm: str, pose: Pose, distance_m: float) -> Pose:
+    out = _copy_pose(pose)
+    if normalize_arm_name(arm) == "left":
+        out.position.y = float(out.position.y) - float(distance_m)
+    else:
+        out.position.y = float(out.position.y) + float(distance_m)
+    return out
+
+
 def _is_grasp_fallback_source(source: str) -> bool:
     normalized = str(source).strip().lower()
     return normalized.startswith("object_center") or normalized.startswith("snack_object_center")
@@ -432,6 +537,50 @@ def _is_grasp_fallback_source(source: str) -> bool:
 def _offset_pose_z(base_pose: Pose, delta_z_m: float) -> Pose:
     pose = _copy_pose(base_pose)
     pose.position.z = float(pose.position.z) + float(delta_z_m)
+    return pose
+
+
+def _build_pringles_extract_target_poses(
+    *,
+    current_left_pose: Pose,
+    current_right_pose: Pose,
+    left_target_xyz: Sequence[float],
+) -> tuple[Pose, Pose]:
+    if len(left_target_xyz) != 3:
+        raise ValueError("left_target_xyz must contain exactly 3 values")
+
+    left_target_pose = _copy_pose(current_left_pose)
+    left_target_pose.position.x = float(left_target_xyz[0])
+    left_target_pose.position.y = float(left_target_xyz[1])
+    left_target_pose.position.z = float(left_target_xyz[2])
+
+    dx = float(left_target_pose.position.x) - float(current_left_pose.position.x)
+    dy = float(left_target_pose.position.y) - float(current_left_pose.position.y)
+    dz = float(left_target_pose.position.z) - float(current_left_pose.position.z)
+
+    right_target_pose = _copy_pose(current_right_pose)
+    right_target_pose.position.x = float(current_right_pose.position.x) + dx
+    right_target_pose.position.y = float(current_right_pose.position.y) + dy
+    right_target_pose.position.z = float(current_right_pose.position.z) + dz
+    return left_target_pose, right_target_pose
+
+
+def _interpolate_pose_position(
+    start_pose: Pose,
+    end_pose: Pose,
+    alpha: float,
+) -> Pose:
+    t = min(1.0, max(0.0, float(alpha)))
+    pose = _copy_pose(start_pose)
+    pose.position.x = float(start_pose.position.x) + (
+        float(end_pose.position.x) - float(start_pose.position.x)
+    ) * t
+    pose.position.y = float(start_pose.position.y) + (
+        float(end_pose.position.y) - float(start_pose.position.y)
+    ) * t
+    pose.position.z = float(start_pose.position.z) + (
+        float(end_pose.position.z) - float(start_pose.position.z)
+    ) * t
     return pose
 
 
@@ -478,12 +627,43 @@ def _build_zero_goal_cspace(
     return goal
 
 
-def _pad_path(path: Sequence[Sequence[float]], length: int) -> list[list[float]]:
+def _resample_path_to_length(
+    path: Sequence[Sequence[float]],
+    length: int,
+) -> list[list[float]]:
     if not path:
         raise RuntimeError("Planner returned an empty path")
-    out = [[float(v) for v in q] for q in path]
-    while len(out) < length:
-        out.append(list(out[-1]))
+
+    target_len = max(1, int(length))
+    src = [[float(v) for v in q] for q in path]
+    if len(src) == target_len:
+        return [list(q) for q in src]
+    if len(src) == 1:
+        return [list(src[0]) for _ in range(target_len)]
+    if target_len == 1:
+        return [list(src[-1])]
+
+    out: list[list[float]] = []
+    src_last = len(src) - 1
+    for out_idx in range(target_len):
+        src_t = (float(out_idx) / float(target_len - 1)) * float(src_last)
+        lo = int(math.floor(src_t))
+        hi = min(src_last, lo + 1)
+        alpha = float(src_t - float(lo))
+        if hi == lo:
+            out.append(list(src[lo]))
+            continue
+
+        q0 = src[lo]
+        q1 = src[hi]
+        if len(q0) != len(q1):
+            raise RuntimeError("Planner returned inconsistent waypoint dimensions")
+        waypoint = [
+            float(a) + math.atan2(math.sin(float(b) - float(a)), math.cos(float(b) - float(a))) * alpha
+            for a, b in zip(q0, q1)
+        ]
+        out.append(waypoint)
+
     return out
 
 
@@ -496,8 +676,8 @@ def _combine_active_joint_paths(
     other_path: Sequence[Sequence[float]],
 ) -> list[list[float]]:
     total = max(len(selected_path), len(other_path))
-    selected_sync = _pad_path(selected_path, total)
-    other_sync = _pad_path(other_path, total)
+    selected_sync = _resample_path_to_length(selected_path, total)
+    other_sync = _resample_path_to_length(other_path, total)
     name_to_idx = {name: idx for idx, name in enumerate(cspace_joint_names)}
     full_path: list[list[float]] = []
     for selected_q, other_q in zip(selected_sync, other_sync):
@@ -671,6 +851,19 @@ def _joint_delta_max_abs(
         _wrapped_joint_delta(float(a[idx]), float(b[idx]))
         for idx in range(count)
     )
+
+
+def _append_joint_path_without_duplicate(
+    out: list[list[float]],
+    path: Sequence[Sequence[float]],
+    *,
+    duplicate_tol: float = 1.0e-6,
+) -> None:
+    for waypoint in path:
+        q = [float(v) for v in waypoint]
+        if out and _joint_delta_max_abs(out[-1], q) <= float(duplicate_tol):
+            continue
+        out.append(q)
 
 
 def _wait_for_joint_motion_progress(
@@ -972,6 +1165,7 @@ class ArmPickingCoordinator(Node):
         self._latest_grasp_seq = 0
         self._gripper_finish_cv = threading.Condition()
         self._latest_gripper_finish_seq = 0
+        self._bimanual_ik_cache: dict[tuple[str, bool, str | None], object] = {}
 
         self._run_startup_warmup()
 
@@ -1113,6 +1307,7 @@ class ArmPickingCoordinator(Node):
                     self._args.robot_yml,
                     arm=arm,
                     cpu=bool(self._args.cpu),
+                    use_cuda_graph=False,
                     world_yml=world_yml,
                 )
                 warmup_single_arm_ik_reachable(
@@ -1128,6 +1323,77 @@ class ArmPickingCoordinator(Node):
         self.get_logger().info(
             f"ARM_PICKING warmup completed in {time.monotonic() - t0:.2f}s"
         )
+
+    def _warmup_bimanual_ik_solver(
+        self,
+        solver,
+        *,
+        stage: str,
+        batch_size: int,
+        iters: int,
+    ) -> None:
+        if int(iters) <= 0:
+            return
+        import torch
+        from curobo.types.math import Pose as CuroboPose
+
+        batch = max(1, int(batch_size))
+        for _ in range(int(iters)):
+            q_left = solver.left_solver.sample_configs(batch)
+            kin_left = solver.left_solver.fk(q_left)
+            goal_left = CuroboPose(kin_left.ee_position, kin_left.ee_quaternion)
+
+            q_right = solver.right_solver.sample_configs(batch)
+            kin_right = solver.right_solver.fk(q_right)
+            goal_right = CuroboPose(kin_right.ee_position, kin_right.ee_quaternion)
+
+            with torch.enable_grad():
+                _ = solver.left_solver.solve_batch(goal_left)
+                _ = solver.right_solver.solve_batch(goal_right)
+
+        if solver.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(solver.device)
+        self.get_logger().info(
+            "[warmup] ready bimanual IK solver: "
+            f"stage={stage} batch_size={batch} iters={int(iters)} "
+            f"world={solver.world_yml if hasattr(solver, 'world_yml') else 'unknown'}"
+        )
+
+    def _get_bimanual_ik_solver(
+        self,
+        *,
+        world_yml: str | None,
+        stage: str,
+    ):
+        from capstone_pkg.kinematics.curobo_ik import FastBimanualIK
+
+        normalized_world = None if world_yml in (None, "", "none", "None") else str(world_yml)
+        key = (str(self._args.robot_yml), bool(self._args.cpu), normalized_world)
+        cached = self._bimanual_ik_cache.get(key)
+        if cached is not None:
+            return cached
+
+        t0 = time.monotonic()
+        solver = FastBimanualIK(
+            str(self._args.robot_yml),
+            left_ee=LEFT_EE_FRAME,
+            right_ee=RIGHT_EE_FRAME,
+            cpu=bool(self._args.cpu),
+            use_cuda_graph=False,
+            world_yml=normalized_world,
+        )
+        self._warmup_bimanual_ik_solver(
+            solver,
+            stage=stage,
+            batch_size=min(100, max(1, int(getattr(self._args, "ik_batch", 100)))),
+            iters=max(0, int(getattr(self._args, "pringles_dual_lift_ik_warmup_iters", 1))),
+        )
+        self._bimanual_ik_cache[key] = solver
+        self.get_logger().info(
+            "[warmup] cached bimanual IK solver: "
+            f"stage={stage} world={normalized_world} elapsed_s={time.monotonic() - t0:.2f}"
+        )
+        return solver
 
     def _on_object_align(self, msg: ObjectAlign) -> None:
         with self._state_lock:
@@ -1280,6 +1546,53 @@ class ArmPickingCoordinator(Node):
             )
         )
         return [float(v) for v in kin.ee_position[0].detach().cpu().tolist()]
+
+    def _compute_ee_pose_from_cspace(
+        self,
+        *,
+        arm: str,
+        q_cspace: Sequence[float],
+        world_yml: str | None,
+    ) -> Pose:
+        import torch
+
+        normalized_arm = normalize_arm_name(arm)
+        ik = get_single_arm_ik(
+            self._args.robot_yml,
+            arm=normalized_arm,
+            cpu=bool(self._args.cpu),
+            use_cuda_graph=False,
+            world_yml=world_yml,
+        )
+        q_active = _extract_joint_positions(
+            q_cspace,
+            ik.cspace_joint_names,
+            ik.active_joint_names,
+        )
+        kin = ik.solver.fk(
+            torch.tensor(
+                [q_active],
+                device=ik.device,
+                dtype=torch.float32,
+            )
+        )
+        if ik.device.type == "cuda" and torch.cuda.is_available():
+            torch.cuda.synchronize(ik.device)
+        xyz = [float(v) for v in kin.ee_position[0].detach().cpu().tolist()]
+        quat_wxyz = [float(v) for v in kin.ee_quaternion[0].detach().cpu().tolist()]
+        pose = Pose()
+        pose.position.x = xyz[0]
+        pose.position.y = xyz[1]
+        pose.position.z = xyz[2]
+        pose.orientation = _normalize_orientation(
+            Quaternion(
+                x=float(quat_wxyz[1]),
+                y=float(quat_wxyz[2]),
+                z=float(quat_wxyz[3]),
+                w=float(quat_wxyz[0]),
+            )
+        )
+        return pose
 
     def _score_grasp_ik_solution(
         self,
@@ -1659,6 +1972,7 @@ class ArmPickingCoordinator(Node):
             ik_seed_noise_std=float(self._args.ik_seed_noise_std),
             ik_seed_random_seed=int(self._args.ik_seed),
             ik_goal_dedupe_tol=float(self._args.ik_goal_dedupe_tol),
+            use_cuda_graph=False,
             tbrrt_cfg=build_single_arm_tbrrt_config(self._args),
             tbrrt_block_k=int(self._args.tbrrt_block_k),
             spline_dt=max(0.001, float(self._args.publish_dt)),
@@ -1763,6 +2077,7 @@ class ArmPickingCoordinator(Node):
             self._args.robot_yml,
             arm=normalized_arm,
             cpu=bool(self._args.cpu),
+            use_cuda_graph=False,
             world_yml=world_yml,
         )
         spline_path = [[float(v) for v in q] for q in out.path]
@@ -1810,6 +2125,7 @@ class ArmPickingCoordinator(Node):
             self._args.robot_yml,
             arm=normalized_arm,
             cpu=bool(self._args.cpu),
+            use_cuda_graph=False,
             world_yml=world_yml,
         )
         q_start_list = [float(v) for v in q_start_cspace]
@@ -1887,6 +2203,664 @@ class ArmPickingCoordinator(Node):
             f"planning_time={planning_time_s:.3f}s target_xyz={target_xyz}"
         )
         self._maybe_save_single_arm_plot(stage=stage, plan=plan, world_yml=world_yml)
+        return plan
+
+    def _plan_pringles_bimanual_constraint_lift(
+        self,
+        *,
+        stage: str,
+        q_start_cspace: Sequence[float],
+        left_target_pose: Pose,
+        right_target_pose: Pose,
+        world_yml: str | None,
+        q_seed_hint_cspace: Sequence[float] | None = None,
+        postprocess: bool = True,
+        constraint_ref_cspace: Sequence[float] | None = None,
+    ) -> SingleArmMotionPlan:
+        import torch
+
+        from capstone_pkg.collision_check.collision import get_self_collision_checker
+        from capstone_pkg.constraint_projection.constraint import RigidConstraint
+        from capstone_pkg.constraint_projection.projection import ManifoldProjectorTorch
+        from capstone_pkg.kinematics.curobo_ik import solve_batch_bimanual
+        from capstone_pkg.planner.arm_rrt_common.single_arm_motion import (
+            _dedupe_q_candidates,
+        )
+        from capstone_pkg.planner.tbrrt.batch.conext import plan_tbrrt_extcon_batch_conext
+        from capstone_pkg.planner.tbrrt_runner import _rerank_q_goals_for_batch_conext
+        from capstone_pkg.utils.joint_limit import load_joint_limits_torch
+
+        is_extract_stage = str(stage).startswith("grasp_pringles_extract")
+        stage_tag = str(stage).replace("grasp_pringles_", "").upper() or "BIMANUAL"
+
+        def _sync_cuda_checkpoint(
+            label: str,
+            sync_device: torch.device | None = None,
+        ) -> None:
+            if not torch.cuda.is_available():
+                return
+            device_for_sync = (
+                sync_device
+                if sync_device is not None
+                else torch.device(f"cuda:{torch.cuda.current_device()}")
+            )
+            if device_for_sync.type != "cuda":
+                return
+            try:
+                torch.cuda.synchronize(device_for_sync)
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    f"[PRINGLES {stage_tag}] CUDA failure at {label}: {exc}"
+                ) from exc
+
+        t_start = time.perf_counter()
+        q_start_list = [float(v) for v in q_start_cspace]
+        q_constraint_ref_list = (
+            [float(v) for v in constraint_ref_cspace]
+            if constraint_ref_cspace is not None
+            else list(q_start_list)
+        )
+        if len(q_constraint_ref_list) != len(q_start_list):
+            raise RuntimeError(
+                f"[PRINGLES {stage_tag}] constraint_ref_cspace length "
+                f"{len(q_constraint_ref_list)} != q_start length {len(q_start_list)}"
+            )
+        _sync_cuda_checkpoint("before self collision checker init")
+        try:
+            checker = get_self_collision_checker(
+                str(self._args.robot_yml),
+                cpu=bool(self._args.cpu),
+                world_yml=world_yml,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"[PRINGLES {stage_tag}] failed during self collision checker init: {exc}"
+            ) from exc
+        device = checker.tensor_args.device
+        _sync_cuda_checkpoint("after self collision checker init", device)
+        dtype = torch.float32
+        _sync_cuda_checkpoint("before joint limits load", device)
+        joint_limits = load_joint_limits_torch(
+            str(self._args.joint_limit_yml),
+            device=device,
+            dtype=dtype,
+        )
+        _sync_cuda_checkpoint("after joint limits load", device)
+        _sync_cuda_checkpoint("before cached FastBimanualIK resolve", device)
+        try:
+            solver = self._get_bimanual_ik_solver(
+                world_yml=world_yml,
+                stage=stage,
+            )
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"[PRINGLES {stage_tag}] failed during cached FastBimanualIK resolve: {exc}"
+            ) from exc
+        _sync_cuda_checkpoint("after cached FastBimanualIK resolve", device)
+        ik_batch = max(1, int(self._args.ik_batch))
+
+        left_xyz = _pose_position_xyz(left_target_pose)
+        left_quat_wxyz = _pose_orientation_wxyz(left_target_pose)
+        right_xyz = _pose_position_xyz(right_target_pose)
+        right_quat_wxyz = _pose_orientation_wxyz(right_target_pose)
+
+        q_ref = torch.tensor(q_constraint_ref_list, device=device, dtype=dtype)
+        constraint = RigidConstraint(
+            robot_yml=str(self._args.robot_yml),
+            left_ee=LEFT_EE_FRAME,
+            right_ee=RIGHT_EE_FRAME,
+            q_ref=q_ref,
+            device=device,
+            dtype=dtype,
+            mode="se3",
+            rigid_orientation=True,
+        )
+        lift_proj_tol = max(
+            float(getattr(self._args, "proj_tol", 1.0e-3)),
+            float(
+                getattr(
+                    self._args,
+                    "pringles_dual_lift_proj_tol",
+                    getattr(self._args, "proj_tol", 1.0e-3),
+                )
+            ),
+        )
+        if is_extract_stage:
+            lift_proj_tol = max(
+                lift_proj_tol,
+                float(getattr(self._args, "pringles_dual_extract_proj_tol", 5.0e-2)),
+            )
+        projector = ManifoldProjectorTorch(
+            constraint=constraint,
+            limits=joint_limits,
+            max_iters=int(getattr(self._args, "proj_iters", 60)),
+            tol=lift_proj_tol,
+            fd_eps=float(getattr(self._args, "proj_fd_eps", 1.0e-3)),
+            damping=float(getattr(self._args, "proj_damping", 0.0)),
+            step_size=float(getattr(self._args, "proj_step", 1.0)),
+        )
+        q_ref_residual = float(
+            torch.linalg.norm(
+                projector.residual(q_ref.view(1, -1)),
+                dim=-1,
+            )[0].item()
+        )
+        if q_ref_residual > lift_proj_tol:
+            self.get_logger().warning(
+                f"[PRINGLES {stage_tag}] q_ref is not on its own bimanual constraint manifold: "
+                f"q_ref_residual={q_ref_residual:.6f} "
+                f"q_dim={len(q_start_list)} "
+                f"constraint_cspace_names={list(constraint.fk.cspace_names)} "
+                f"solver_cspace_names={list(solver.cspace_joint_names)}"
+            )
+
+        cand_q: list[list[float]] = []
+        free_q: list[list[float]] = []
+        rejected_pen: list[tuple[float, float, float]] = []
+        root_projectable_q: list[list[float]] = []
+        best_root_residual = float("inf")
+        best_root_success = False
+        ik_attempts = max(1, int(getattr(self._args, "pringles_dual_lift_ik_attempts", 8)))
+        if is_extract_stage:
+            ik_attempts = max(
+                ik_attempts,
+                int(getattr(self._args, "pringles_dual_extract_ik_attempts", 16)),
+            )
+        lift_use_seed_config = bool(
+            getattr(self._args, "pringles_dual_lift_use_seed_config", True)
+        )
+        extract_seed_noise_std = max(
+            0.0,
+            float(getattr(self._args, "pringles_dual_extract_ik_seed_noise_std", 0.25)),
+        )
+        q_seed_hint_list = (
+            [float(v) for v in q_seed_hint_cspace]
+            if q_seed_hint_cspace is not None
+            else None
+        )
+        for attempt_idx in range(ik_attempts):
+            q_seed_cspace_batch = None
+            attempt_use_seed_config = lift_use_seed_config
+            seed_mode = "q_start"
+            if is_extract_stage and q_seed_hint_list is not None and attempt_idx == 0:
+                q_seed_cspace_batch = [list(q_seed_hint_list) for _ in range(ik_batch)]
+                seed_mode = "extrapolated_hint"
+            elif is_extract_stage and attempt_idx > 0 and (attempt_idx % 2) == 1:
+                attempt_use_seed_config = False
+                seed_mode = "solver_default"
+            elif is_extract_stage and attempt_idx > 0 and lift_use_seed_config:
+                seed_mode = "q_start_noisy"
+                q_seed = q_ref.view(1, -1).repeat(ik_batch, 1)
+                if extract_seed_noise_std > 0.0:
+                    noise = torch.randn(
+                        q_seed.shape,
+                        device=device,
+                        dtype=dtype,
+                    ) * float(extract_seed_noise_std)
+                    noise[0].zero_()
+                    q_seed = q_seed + noise
+                q_seed = joint_limits.clamp(q_seed)
+                q_seed_cspace_batch = [
+                    [float(v) for v in row]
+                    for row in q_seed.detach().cpu().tolist()
+                ]
+            ik_outs = solve_batch_bimanual(
+                solver,
+                [list(left_xyz) for _ in range(ik_batch)],
+                [list(left_quat_wxyz) for _ in range(ik_batch)],
+                [list(right_xyz) for _ in range(ik_batch)],
+                [list(right_quat_wxyz) for _ in range(ik_batch)],
+                q_start_cspace=q_start_list,
+                q_seed_cspace_batch=q_seed_cspace_batch,
+                parallel_cuda_streams=bool(
+                    getattr(self._args, "pringles_dual_lift_parallel_cuda_streams", False)
+                ),
+                use_seed_config=attempt_use_seed_config,
+            )
+            _sync_cuda_checkpoint(
+                f"after bimanual CuRobo IK solve attempt {attempt_idx + 1}",
+                device,
+            )
+            attempt_cand = [
+                [float(v) for v in out.q_cspace]
+                for out in ik_outs
+                if out.success and out.q_cspace is not None
+            ]
+            if attempt_cand:
+                cand_q = _dedupe_q_candidates(
+                    cand_q + attempt_cand,
+                    atol=float(self._args.ik_goal_dedupe_tol),
+                )
+
+            free_q = []
+            rejected_pen = []
+            for q_goal in cand_q:
+                in_collision, d_self_max, d_world_max = checker.check_single(q_goal)
+                if bool(in_collision):
+                    rejected_pen.append(
+                        (
+                            max(float(d_self_max), float(d_world_max)),
+                            float(d_self_max),
+                            float(d_world_max),
+                        )
+                    )
+                    continue
+                free_q.append([float(v) for v in q_goal])
+
+            root_projectable_q = []
+            if free_q:
+                root_proj = projector.project_batch(
+                    torch.tensor(free_q, device=device, dtype=dtype)
+                )
+                root_success = [
+                    bool(v) for v in root_proj.success_mask.detach().cpu().tolist()
+                ]
+                root_residuals = [
+                    float(v) for v in root_proj.final_residual.detach().cpu().tolist()
+                ]
+                if root_residuals:
+                    attempt_best_residual = min(root_residuals)
+                    if attempt_best_residual < best_root_residual:
+                        best_root_residual = attempt_best_residual
+                        best_root_success = any(root_success)
+                root_projectable_q = [
+                    [float(v) for v in q_goal]
+                    for q_goal, success in zip(free_q, root_success)
+                    if bool(success)
+                ]
+
+            self.get_logger().info(
+                f"[PRINGLES {stage_tag}] bimanual IK attempt: "
+                f"attempt={attempt_idx + 1}/{ik_attempts} "
+                f"use_seed_config={attempt_use_seed_config} "
+                f"seed_mode={seed_mode} "
+                f"batch_success={len(attempt_cand)} "
+                f"unique_success={len(cand_q)} free={len(free_q)} "
+                f"root_projectable={len(root_projectable_q)} "
+                f"best_root_residual={best_root_residual:.6f}"
+            )
+            if root_projectable_q:
+                break
+
+        if not cand_q:
+            raise RuntimeError(f"[PRINGLES {stage_tag}] batch bimanual CuRobo IK success=0")
+        if not free_q:
+            if rejected_pen:
+                best_pen, best_self, best_world = min(rejected_pen, key=lambda item: item[0])
+                self.get_logger().warning(
+                    f"[PRINGLES {stage_tag}] all bimanual IK candidates rejected by collision: "
+                    f"unique_success={len(cand_q)} best_self={best_self:.6f} "
+                    f"best_world={best_world:.6f} best_pen={best_pen:.6f}"
+                )
+            raise RuntimeError(f"[PRINGLES {stage_tag}] batch bimanual CuRobo IK collision-free=0")
+
+        q_goals = root_projectable_q if root_projectable_q else list(free_q)
+        if not root_projectable_q:
+            self.get_logger().warning(
+                f"[PRINGLES {stage_tag}] no collision-free IK goal passed root projection before rerank: "
+                f"unique_success={len(cand_q)} free={len(free_q)} "
+                f"best_root_success={best_root_success} "
+                f"best_root_residual={best_root_residual:.6f}"
+            )
+        q_goals = _rerank_q_goals_for_batch_conext(
+            q_start=q_start_list,
+            q_goals=q_goals,
+            projector=projector,
+            checker=checker,
+            device=device,
+            topk=int(getattr(self._args, "goal_rerank_topk", 3)),
+            interp_points=int(getattr(self._args, "goal_rerank_interp_points", 6)),
+        )
+        start_proj = projector.project_batch(
+            torch.tensor([q_start_list], device=device, dtype=dtype)
+        )
+        _sync_cuda_checkpoint("after start root projection precheck")
+        goal_proj = projector.project_batch(
+            torch.tensor(q_goals, device=device, dtype=dtype)
+        )
+        _sync_cuda_checkpoint("after goal root projection precheck")
+        start_success = bool(start_proj.success_mask.detach().cpu().tolist()[0])
+        start_residual = float(start_proj.final_residual.detach().cpu().tolist()[0])
+        start_iters = int(start_proj.iters.detach().cpu().tolist()[0])
+        goal_success = goal_proj.success_mask.detach().cpu().tolist()
+        if (not start_success) or (not all(bool(v) for v in goal_success)):
+            goal_residuals = [
+                float(v)
+                for v in goal_proj.final_residual.detach().cpu().tolist()
+            ]
+            goal_iters = [
+                int(v)
+                for v in goal_proj.iters.detach().cpu().tolist()
+            ]
+            failed_goal_indices = [
+                idx
+                for idx, success in enumerate(goal_success)
+                if not bool(success)
+            ]
+            goal_fail_details = [
+                {
+                    "idx": int(idx),
+                    "residual": goal_residuals[idx],
+                    "iters": goal_iters[idx],
+                }
+                for idx in failed_goal_indices
+            ]
+            self.get_logger().warning(
+                f"[PRINGLES {stage_tag}] batch TBRRT root projection failed: "
+                f"start_success={start_success} "
+                f"start_residual={start_residual:.6f} "
+                f"start_iters={start_iters} "
+                f"q_ref_residual={q_ref_residual:.6f} "
+                f"failed_goal_indices={failed_goal_indices} "
+                f"goal_fail_details={goal_fail_details}"
+            )
+            raise RuntimeError(
+                f"[PRINGLES {stage_tag}] batch TBRRT root projection failed: "
+                f"start_success={start_success} "
+                f"failed_goal_indices={failed_goal_indices} "
+                f"start_residual={start_residual:.6f} "
+                f"q_ref_residual={q_ref_residual:.6f} "
+                f"goal_fail_details={goal_fail_details}"
+            )
+        if is_extract_stage and bool(
+            getattr(self._args, "pringles_dual_extract_direct_edge", True)
+        ):
+            q0_proj = start_proj.q_proj[0]
+            direct_step_q = max(
+                1.0e-4,
+                float(getattr(self._args, "pringles_dual_extract_direct_edge_step_q", 0.02)),
+            )
+            direct_max_points = max(
+                2,
+                int(getattr(self._args, "pringles_dual_extract_direct_edge_max_points", 128)),
+            )
+            for direct_goal_idx in range(int(goal_proj.q_proj.shape[0])):
+                q1_proj = goal_proj.q_proj[direct_goal_idx]
+                delta = torch.atan2(torch.sin(q1_proj - q0_proj), torch.cos(q1_proj - q0_proj))
+                max_delta = float(torch.max(torch.abs(delta)).item())
+                direct_steps = max(1, int(math.ceil(max_delta / direct_step_q)))
+                if direct_steps + 1 > direct_max_points:
+                    continue
+                alpha = torch.linspace(
+                    0.0,
+                    1.0,
+                    direct_steps + 1,
+                    device=device,
+                    dtype=dtype,
+                ).view(-1, 1)
+                q_line = q0_proj.view(1, -1) + alpha * delta.view(1, -1)
+                line_proj = projector.project_batch(q_line)
+                line_success = bool(line_proj.success_mask.detach().cpu().all().item())
+                line_max_residual = float(line_proj.final_residual.max().item())
+                if (not line_success) or line_max_residual > lift_proj_tol:
+                    continue
+                line_collision = checker.check_batch(line_proj.q_proj)
+                line_in_collision = bool(line_collision.in_collision.detach().cpu().any().item())
+                line_max_pen = float(line_collision.pen_max.max().item())
+                if line_in_collision:
+                    continue
+
+                spline_path = [
+                    [float(v) for v in row]
+                    for row in line_proj.q_proj.detach().cpu().tolist()
+                ]
+                plan = SingleArmMotionPlan(
+                    arm="left",
+                    cspace_joint_names=list(solver.cspace_joint_names),
+                    active_joint_names=_arm_joint_names("left"),
+                    q_start_cspace=[float(v) for v in q_start_list],
+                    q_goal_cspace=[float(v) for v in spline_path[-1]],
+                    raw_path=[list(q) for q in spline_path],
+                    spline_path=[list(q) for q in spline_path],
+                )
+                planning_time_s = time.perf_counter() - t_start
+                self.get_logger().info(
+                    "[TRAJ] Pringles bimanual constraint direct edge accepted: "
+                    f"stage={stage} goal_idx={direct_goal_idx} "
+                    f"waypoints={len(plan.spline_path)} "
+                    f"planning_time={planning_time_s:.3f}s "
+                    f"max_delta={max_delta:.6f} "
+                    f"max_residual={line_max_residual:.6f} "
+                    f"max_pen={line_max_pen:.6f} "
+                    f"left_target={left_xyz} right_target={right_xyz}"
+                )
+                self._maybe_save_full_path_plot(
+                    stage=stage,
+                    full_path=plan.spline_path,
+                    cspace_joint_names=plan.cspace_joint_names,
+                    world_yml=world_yml,
+                )
+                return plan
+        tbrrt_cfg = build_single_arm_tbrrt_config(self._args)
+        if not bool(postprocess):
+            tbrrt_cfg = replace(
+                tbrrt_cfg,
+                shortcut_smoothing=False,
+                spline_interpolation=False,
+                topp_enable=False,
+            )
+        block_k = int(self._args.tbrrt_block_k)
+        if is_extract_stage:
+            tbrrt_cfg = replace(
+                tbrrt_cfg,
+                time_limit_sec=max(
+                    float(tbrrt_cfg.time_limit_sec),
+                    float(getattr(self._args, "pringles_dual_extract_tbrrt_time_limit_s", _PRINGLES_DUAL_EXTRACT_TBRRT_TIME_LIMIT_S)),
+                ),
+                max_iters=max(
+                    int(tbrrt_cfg.max_iters),
+                    int(getattr(self._args, "pringles_dual_extract_max_iters", 500000)),
+                ),
+            )
+            block_k = max(
+                block_k,
+                int(getattr(self._args, "pringles_dual_extract_tbrrt_block_k", _PRINGLES_DUAL_EXTRACT_TBRRT_BLOCK_K)),
+            )
+
+        out = plan_tbrrt_extcon_batch_conext(
+            q_start=q_start_list,
+            q_goals=q_goals,
+            cfg=tbrrt_cfg,
+            checker=checker,
+            projector=projector,
+            joint_limits=joint_limits,
+            device=device,
+            block_K=block_k,
+        )
+        if not out.success or not out.path:
+            extra = getattr(out.stats, "extra", {})
+            raise RuntimeError(f"[PRINGLES {stage_tag}] batch TBRRT failed: {extra}")
+
+        spline_path = [[float(v) for v in q] for q in out.path]
+        plan = SingleArmMotionPlan(
+            arm="left",
+            cspace_joint_names=list(solver.cspace_joint_names),
+            active_joint_names=_arm_joint_names("left"),
+            q_start_cspace=[float(v) for v in q_start_list],
+            q_goal_cspace=[float(v) for v in spline_path[-1]],
+            raw_path=[list(q) for q in spline_path],
+            spline_path=[list(q) for q in spline_path],
+        )
+        planning_time_s = time.perf_counter() - t_start
+        self.get_logger().info(
+            "[TRAJ] Pringles bimanual constraint motion planned with batch TBRRT: "
+            f"stage={stage} waypoints={len(plan.spline_path)} "
+            f"planning_time={planning_time_s:.3f}s "
+            f"ik_batch={ik_batch} unique_success={len(cand_q)} "
+            f"free={len(free_q)} goals={len(q_goals)} "
+            f"left_target={left_xyz} right_target={right_xyz}"
+        )
+        self._maybe_save_full_path_plot(
+            stage=stage,
+            full_path=plan.spline_path,
+            cspace_joint_names=plan.cspace_joint_names,
+            world_yml=world_yml,
+        )
+        return plan
+
+    def _postprocess_pringles_bimanual_full_path(
+        self,
+        *,
+        stage: str,
+        q_ref_cspace: Sequence[float],
+        raw_path: Sequence[Sequence[float]],
+        world_yml: str | None,
+    ) -> SingleArmMotionPlan:
+        import torch
+
+        from capstone_pkg.collision_check.collision import get_self_collision_checker
+        from capstone_pkg.collision_check.edge_collision import EdgeCollisionChecker
+        from capstone_pkg.constraint_projection.constraint import RigidConstraint
+        from capstone_pkg.constraint_projection.projection import ManifoldProjectorTorch
+        from capstone_pkg.planner.tbrrt.postprocess import (
+            cubic_spline_interpolate_and_validate_path,
+            topp_retime_path,
+        )
+        from capstone_pkg.utils.joint_limit import load_joint_limits_torch
+
+        if len(raw_path) < 2:
+            raise RuntimeError("Pringles full-path postprocess requires at least two waypoints")
+
+        q_ref_list = [float(v) for v in q_ref_cspace]
+        path_list = [[float(v) for v in row] for row in raw_path]
+        if any(len(row) != len(q_ref_list) for row in path_list):
+            raise RuntimeError("Pringles full-path waypoint dimension mismatch")
+
+        checker = get_self_collision_checker(
+            str(self._args.robot_yml),
+            cpu=bool(self._args.cpu),
+            world_yml=world_yml,
+        )
+        device = checker.tensor_args.device
+        dtype = torch.float32
+        joint_limits = load_joint_limits_torch(
+            str(self._args.joint_limit_yml),
+            device=device,
+            dtype=dtype,
+        )
+        q_ref = torch.tensor(q_ref_list, device=device, dtype=dtype)
+        constraint = RigidConstraint(
+            robot_yml=str(self._args.robot_yml),
+            left_ee=LEFT_EE_FRAME,
+            right_ee=RIGHT_EE_FRAME,
+            q_ref=q_ref,
+            device=device,
+            dtype=dtype,
+            mode="se3",
+            rigid_orientation=True,
+        )
+        proj_tol = max(
+            float(getattr(self._args, "proj_tol", 1.0e-3)),
+            float(getattr(self._args, "pringles_dual_lift_proj_tol", 5.0e-3)),
+            float(getattr(self._args, "pringles_dual_extract_proj_tol", 5.0e-2)),
+        )
+        projector = ManifoldProjectorTorch(
+            constraint=constraint,
+            limits=joint_limits,
+            max_iters=int(getattr(self._args, "proj_iters", 60)),
+            tol=proj_tol,
+            fd_eps=float(getattr(self._args, "proj_fd_eps", 1.0e-3)),
+            damping=float(getattr(self._args, "proj_damping", 0.0)),
+            step_size=float(getattr(self._args, "proj_step", 1.0)),
+        )
+        cfg = build_single_arm_tbrrt_config(self._args)
+        edge_checker = EdgeCollisionChecker(
+            robot_yml=checker.robot_yml,
+            cpu=(device.type == "cpu"),
+            world_yml=checker.world_yml,
+            step_q=float(getattr(cfg, "edge_step_q", 0.03)),
+            max_steps=int(getattr(cfg, "edge_max_steps", 64)),
+        )
+
+        q_raw = torch.tensor(path_list, device=device, dtype=dtype)
+        raw_proj = projector.project_batch(q_raw)
+        if not bool(raw_proj.success_mask.detach().cpu().all().item()):
+            failed = [
+                idx
+                for idx, success in enumerate(raw_proj.success_mask.detach().cpu().tolist())
+                if not bool(success)
+            ]
+            residuals = raw_proj.final_residual.detach().cpu().tolist()
+            details = [
+                {"idx": int(idx), "residual": float(residuals[idx])}
+                for idx in failed[:8]
+            ]
+            raise RuntimeError(
+                "[PRINGLES FULL] failed to project concatenated raw path: "
+                f"failed_indices={failed[:16]} details={details}"
+            )
+        q_path = raw_proj.q_proj.contiguous()
+
+        col_out = checker.check_batch(q_path)
+        if bool(col_out.in_collision.detach().cpu().any().item()):
+            bad_count = int(col_out.in_collision.detach().cpu().sum().item())
+            max_pen = float(col_out.pen_max.detach().cpu().max().item())
+            raise RuntimeError(
+                "[PRINGLES FULL] projected concatenated raw path is in collision: "
+                f"bad_points={bad_count} max_pen={max_pen:.6f}"
+            )
+
+        spline_stats = None
+        if bool(getattr(cfg, "spline_interpolation", True)):
+            q_path, spline_stats = cubic_spline_interpolate_and_validate_path(
+                q_path,
+                projector=projector,
+                checker=checker,
+                edge_checker=edge_checker,
+                joint_limits=joint_limits,
+                step_q=float(getattr(cfg, "spline_step_q", getattr(cfg, "edge_step_q", 0.03))),
+                max_steps_per_segment=int(
+                    getattr(cfg, "spline_max_steps_per_segment", getattr(cfg, "edge_max_steps", 64))
+                ),
+                max_points=int(getattr(cfg, "spline_max_points", 2048)),
+                fallback_to_input=bool(getattr(cfg, "spline_fallback_to_input", True)),
+                use_batch_projection=True,
+            )
+
+        trajectory = None
+        if bool(getattr(cfg, "topp_enable", True)):
+            trajectory = topp_retime_path(
+                q_path,
+                max_velocity=getattr(cfg, "topp_max_velocity", 1.0),
+                max_acceleration=getattr(cfg, "topp_max_acceleration", 2.0),
+                output_dt=max(1.0e-3, float(self._args.publish_dt)),
+                max_duration_sec=None,
+                safety_scale=float(getattr(cfg, "topp_safety_scale", 1.05)),
+                max_iterations=int(getattr(cfg, "topp_max_iterations", 20)),
+            )
+            q_path = trajectory.q
+
+        final_path = [
+            [float(v) for v in row]
+            for row in q_path.detach().cpu().tolist()
+        ]
+        if len(final_path) < 2:
+            raise RuntimeError("[PRINGLES FULL] full-path postprocess produced too few waypoints")
+
+        topp_duration_label = "none" if trajectory is None else f"{float(trajectory.duration_sec):.3f}"
+        self.get_logger().info(
+            "[TRAJ] Pringles full lift/extract path postprocessed: "
+            f"stage={stage} raw={len(path_list)} projected={int(raw_proj.q_proj.shape[0])} "
+            f"final={len(final_path)} "
+            f"spline_success={None if spline_stats is None else bool(spline_stats.success)} "
+            f"spline_fallback={None if spline_stats is None else bool(spline_stats.fallback_used)} "
+            f"topp_duration_s={topp_duration_label}"
+        )
+        plan = SingleArmMotionPlan(
+            arm="left",
+            cspace_joint_names=list(CSPACE_JOINT_NAMES_14),
+            active_joint_names=_arm_joint_names("left"),
+            q_start_cspace=[float(v) for v in q_ref_list],
+            q_goal_cspace=[float(v) for v in final_path[-1]],
+            raw_path=[list(q) for q in path_list],
+            spline_path=[list(q) for q in final_path],
+        )
+        self._maybe_save_full_path_plot(
+            stage=stage,
+            full_path=plan.spline_path,
+            cspace_joint_names=plan.cspace_joint_names,
+            world_yml=world_yml,
+        )
         return plan
 
     def _publish_single_arm_joint_path(
@@ -2745,6 +3719,388 @@ class ArmPickingCoordinator(Node):
         else:
             self._publish_arm_picking_finish(arm, stage=stage)
 
+    def _execute_pringles_dual_grasp_sequence(
+        self,
+        *,
+        selected_arm: str,
+        base_world_yml: str | None,
+        use_one_step_finish_on_complete: bool = False,
+    ) -> None:
+        grasp_seq = int(self._latest_grasp_seq)
+        grasp_attempt = 0
+        while True:
+            grasp_msg, grasp_seq = self._wait_for_object_grasp(
+                arm=selected_arm,
+                min_seq=grasp_seq,
+                timeout_s=float(self._args.object_grasp_wait_s),
+            )
+            try:
+                object_label = str(getattr(grasp_msg, "label", "")).strip()
+                if object_label and not _is_pringles_grasp_msg(grasp_msg):
+                    self.get_logger().warning(
+                        "[ARM_PICKING] Pringles dual grasp mode received non-Pringles label; "
+                        f"continuing with box-based dual target: label={object_label!r}"
+                    )
+
+                raw_object_pose = _copy_pose(grasp_msg.object_pose)
+                raw_object_size = _copy_vector3(grasp_msg.object_size)
+                object_pose = _copy_pose(raw_object_pose)
+                object_pose.position.x = (
+                    float(object_pose.position.x) + float(_GRASP_OBJECT_POSE_X_OFFSET_M)
+                )
+                object_size = _copy_vector3(raw_object_size)
+                object_size.x = float(_GRASP_COLLISION_OBJECT_SIZE_X_M)
+                object_size.y = float(_SNACK_COLLISION_OBJECT_SIZE_Y_M)
+                object_world_yml = _merge_world_with_user_object(
+                    base_world_yml,
+                    center_xyz=_pose_position_xyz(object_pose),
+                    dims_xyz=_vector3_xyz(object_size),
+                    quat_wxyz=_pose_orientation_wxyz(object_pose),
+                    object_name=(
+                        object_label
+                        if object_label
+                        else str(getattr(self._args, "grasp_object_name", "grasp_object"))
+                    ),
+                )
+                _publish_world_collision_for_mujoco(self._args, object_world_yml)
+
+                left_target_pose, right_target_pose = _build_pringles_dual_grasp_target_poses(
+                    grasp_msg,
+                    side_clearance_m=float(self._args.pringles_dual_grasp_side_clearance_m),
+                    x_offset_m=float(self._args.pringles_dual_grasp_x_offset_m),
+                    z_offset_m=float(self._args.pringles_dual_grasp_z_offset_m),
+                )
+                self.get_logger().info(
+                    "[ARM_PICKING] Pringles dual grasp targets: "
+                    f"object_center={_pose_position_xyz(raw_object_pose)} "
+                    f"object_size={_vector3_xyz(raw_object_size)} "
+                    f"left_target={_pose_position_xyz(left_target_pose)} "
+                    f"right_target={_pose_position_xyz(right_target_pose)} "
+                    f"target_quat_xyzw={_pose_orientation_xyzw(left_target_pose)}"
+                )
+
+                q_start_cspace = self._resolve_grasp_q_start_cspace(
+                    arm="left",
+                    world_yml=object_world_yml,
+                )
+                left_plan = self._plan_selected_arm(
+                    stage="grasp_pringles_left",
+                    arm="left",
+                    target_pose=left_target_pose,
+                    world_yml=object_world_yml,
+                    q_start_cspace=q_start_cspace,
+                )
+                right_plan = self._plan_selected_arm(
+                    stage="grasp_pringles_right",
+                    arm="right",
+                    target_pose=right_target_pose,
+                    world_yml=object_world_yml,
+                    q_start_cspace=q_start_cspace,
+                )
+                full_path = _build_combined_full_path(
+                    selected_plan=left_plan,
+                    other_plan=right_plan,
+                    selected_arm="left",
+                    other_arm="right",
+                )
+                self._wait_for_both_arms(
+                    stage="grasp_pringles",
+                    plan=left_plan,
+                    full_path=full_path,
+                    selected_arm="left",
+                    other_arm="right",
+                )
+
+                post_grasp_world_yml = base_world_yml
+                if object_world_yml != post_grasp_world_yml:
+                    self.get_logger().info(
+                        "[ARM_PICKING] Pringles post-target inward motion uses base world only; "
+                        "object collision model is not included in these single-arm plans."
+                    )
+                    _publish_world_collision_for_mujoco(self._args, post_grasp_world_yml)
+
+                final_dual_q_start = [float(v) for v in full_path[-1]]
+                left_inward_pose = _offset_pringles_inward_pose(
+                    "left",
+                    left_target_pose,
+                    float(self._args.pringles_dual_grasp_inward_y_m),
+                )
+                left_inward_plan = self._plan_selected_arm(
+                    stage="grasp_pringles_inward_left",
+                    arm="left",
+                    target_pose=left_inward_pose,
+                    world_yml=post_grasp_world_yml,
+                    q_start_cspace=final_dual_q_start,
+                )
+                right_inward_pose = _offset_pringles_inward_pose(
+                    "right",
+                    right_target_pose,
+                    float(self._args.pringles_dual_grasp_inward_y_m),
+                )
+                right_inward_plan = self._plan_selected_arm(
+                    stage="grasp_pringles_inward_right",
+                    arm="right",
+                    target_pose=right_inward_pose,
+                    world_yml=post_grasp_world_yml,
+                    q_start_cspace=final_dual_q_start,
+                )
+
+                inward_full_path = _build_combined_full_path(
+                    selected_plan=left_inward_plan,
+                    other_plan=right_inward_plan,
+                    selected_arm="left",
+                    other_arm="right",
+                )
+                self._wait_for_both_arms(
+                    stage="grasp_pringles_inward",
+                    plan=left_inward_plan,
+                    full_path=inward_full_path,
+                    selected_arm="left",
+                    other_arm="right",
+                )
+
+                lift_z_m = float(self._args.pringles_dual_grasp_lift_z_m)
+                try:
+                    lift_q_start_cspace = read_joint_positions_once(
+                        list(CSPACE_JOINT_NAMES_14),
+                        topic=str(self._args.joint_state_topic),
+                        wait_s=float(self._args.joint_state_wait_s),
+                    )
+                    planned_lift_start = [float(v) for v in inward_full_path[-1]]
+                    self.get_logger().info(
+                        "[ARM_PICKING] Pringles lift uses current joint state as q_start/q_ref: "
+                        f"delta_from_planned={_joint_delta_l2(lift_q_start_cspace, planned_lift_start):.6f}"
+                    )
+                except RuntimeError as exc:
+                    lift_q_start_cspace = [float(v) for v in inward_full_path[-1]]
+                    self.get_logger().warning(
+                        "[ARM_PICKING] failed to read current joint state before Pringles lift; "
+                        "falling back to planned inward endpoint as q_start/q_ref: "
+                        f"{exc}"
+                    )
+                try:
+                    current_left_pose = self._compute_ee_pose_from_cspace(
+                        arm="left",
+                        q_cspace=lift_q_start_cspace,
+                        world_yml=post_grasp_world_yml,
+                    )
+                    current_right_pose = self._compute_ee_pose_from_cspace(
+                        arm="right",
+                        q_cspace=lift_q_start_cspace,
+                        world_yml=post_grasp_world_yml,
+                    )
+                    left_lift_pose = _offset_pose_z(current_left_pose, lift_z_m)
+                    right_lift_pose = _offset_pose_z(current_right_pose, lift_z_m)
+                    self.get_logger().info(
+                        "[ARM_PICKING] Pringles lift targets use current FK pose plus z offset: "
+                        f"left_current={_pose_position_xyz(current_left_pose)} "
+                        f"right_current={_pose_position_xyz(current_right_pose)} "
+                        f"lift_z_m={lift_z_m:.3f}"
+                    )
+                except Exception as exc:
+                    left_lift_pose = _offset_pose_z(left_inward_pose, lift_z_m)
+                    right_lift_pose = _offset_pose_z(right_inward_pose, lift_z_m)
+                    self.get_logger().warning(
+                        "[ARM_PICKING] failed to compute current FK before Pringles lift; "
+                        "falling back to planned inward poses plus z offset: "
+                        f"{exc}"
+                    )
+                lift_plan = self._plan_pringles_bimanual_constraint_lift(
+                    stage="grasp_pringles_lift",
+                    q_start_cspace=lift_q_start_cspace,
+                    left_target_pose=left_lift_pose,
+                    right_target_pose=right_lift_pose,
+                    world_yml=post_grasp_world_yml,
+                    postprocess=False,
+                )
+                full_lift_extract_path: list[list[float]] = []
+                _append_joint_path_without_duplicate(
+                    full_lift_extract_path,
+                    lift_plan.spline_path,
+                )
+
+                extract_q_start_cspace = [float(v) for v in lift_plan.spline_path[-1]]
+                self.get_logger().info(
+                    "[ARM_PICKING] Pringles extract planning is deferred after lift planning: "
+                    "using planned lift endpoint as extract q_start; full lift/extract "
+                    "trajectory will be postprocessed and published once."
+                )
+                try:
+                    extract_current_left_pose = self._compute_ee_pose_from_cspace(
+                        arm="left",
+                        q_cspace=extract_q_start_cspace,
+                        world_yml=post_grasp_world_yml,
+                    )
+                    extract_current_right_pose = self._compute_ee_pose_from_cspace(
+                        arm="right",
+                        q_cspace=extract_q_start_cspace,
+                        world_yml=post_grasp_world_yml,
+                    )
+                except Exception as exc:
+                    extract_current_left_pose = _copy_pose(left_lift_pose)
+                    extract_current_right_pose = _copy_pose(right_lift_pose)
+                    self.get_logger().warning(
+                        "[ARM_PICKING] failed to compute current FK before Pringles extract; "
+                        "falling back to planned lift poses: "
+                        f"{exc}"
+                    )
+                extract_left_pose, extract_right_pose = _build_pringles_extract_target_poses(
+                    current_left_pose=extract_current_left_pose,
+                    current_right_pose=extract_current_right_pose,
+                    left_target_xyz=list(self._args.pringles_dual_extract_left_xyz_m),
+                )
+                extract_final_left_pose = _copy_pose(extract_left_pose)
+                extract_final_right_pose = _copy_pose(extract_right_pose)
+                extract_segments = max(1, int(self._args.pringles_dual_extract_segments))
+                self.get_logger().info(
+                    "[ARM_PICKING] Pringles extract targets preserve rigid orientation/relative pose: "
+                    f"left_current={_pose_position_xyz(extract_current_left_pose)} "
+                    f"right_current={_pose_position_xyz(extract_current_right_pose)} "
+                    f"left_target={_pose_position_xyz(extract_final_left_pose)} "
+                    f"right_target={_pose_position_xyz(extract_final_right_pose)} "
+                    f"left_quat_xyzw={_pose_orientation_xyzw(extract_final_left_pose)} "
+                    f"right_quat_xyzw={_pose_orientation_xyzw(extract_final_right_pose)} "
+                    f"segments={extract_segments}"
+                )
+                extract_segment_q_start = [float(v) for v in extract_q_start_cspace]
+                extract_segment_left_pose = _copy_pose(extract_current_left_pose)
+                extract_segment_right_pose = _copy_pose(extract_current_right_pose)
+                extract_segment_seed_hint: list[float] | None = None
+                extract_plan: SingleArmMotionPlan | None = None
+                for segment_idx in range(1, extract_segments + 1):
+                    remaining_segments = extract_segments - segment_idx + 1
+                    next_left_step_pose = _interpolate_pose_position(
+                        extract_segment_left_pose,
+                        extract_final_left_pose,
+                        1.0 / float(remaining_segments),
+                    )
+                    segment_left_pose, segment_right_pose = (
+                        _build_pringles_extract_target_poses(
+                            current_left_pose=extract_segment_left_pose,
+                            current_right_pose=extract_segment_right_pose,
+                            left_target_xyz=_pose_position_xyz(next_left_step_pose),
+                        )
+                    )
+                    segment_stage = (
+                        "grasp_pringles_extract"
+                        if extract_segments == 1
+                        else f"grasp_pringles_extract_s{segment_idx:02d}"
+                    )
+                    self.get_logger().info(
+                        "[ARM_PICKING] Pringles extract segment target: "
+                        f"segment={segment_idx}/{extract_segments} "
+                        f"stage={segment_stage} "
+                        f"left_start={_pose_position_xyz(extract_segment_left_pose)} "
+                        f"right_start={_pose_position_xyz(extract_segment_right_pose)} "
+                        f"left_target={_pose_position_xyz(segment_left_pose)} "
+                        f"right_target={_pose_position_xyz(segment_right_pose)}"
+                    )
+                    planned_segment_start = [float(v) for v in extract_segment_q_start]
+                    extract_plan = self._plan_pringles_bimanual_constraint_lift(
+                        stage=segment_stage,
+                        q_start_cspace=extract_segment_q_start,
+                        left_target_pose=segment_left_pose,
+                        right_target_pose=segment_right_pose,
+                        world_yml=post_grasp_world_yml,
+                        q_seed_hint_cspace=extract_segment_seed_hint,
+                        postprocess=False,
+                        constraint_ref_cspace=lift_q_start_cspace,
+                    )
+                    _append_joint_path_without_duplicate(
+                        full_lift_extract_path,
+                        extract_plan.spline_path,
+                    )
+                    extract_left_pose = segment_left_pose
+                    extract_right_pose = segment_right_pose
+                    if segment_idx >= extract_segments:
+                        break
+
+                    planned_segment_end = [
+                        float(v) for v in extract_plan.spline_path[-1]
+                    ]
+                    segment_delta_hint = [
+                        math.atan2(math.sin(float(q1) - float(q0)), math.cos(float(q1) - float(q0)))
+                        for q0, q1 in zip(planned_segment_start, planned_segment_end)
+                    ]
+                    next_segment_q_start = [
+                        float(v) for v in extract_plan.spline_path[-1]
+                    ]
+                    self.get_logger().info(
+                        "[ARM_PICKING] Pringles extract next segment planned offline: "
+                        f"segment={segment_idx + 1}/{extract_segments} "
+                        "using planned previous segment endpoint as q_start."
+                    )
+                    extract_segment_q_start = [float(v) for v in next_segment_q_start]
+                    extract_segment_seed_hint = [
+                        float(q) + float(d)
+                        for q, d in zip(extract_segment_q_start, segment_delta_hint)
+                    ]
+                    try:
+                        extract_segment_left_pose = self._compute_ee_pose_from_cspace(
+                            arm="left",
+                            q_cspace=extract_segment_q_start,
+                            world_yml=post_grasp_world_yml,
+                        )
+                        extract_segment_right_pose = self._compute_ee_pose_from_cspace(
+                            arm="right",
+                            q_cspace=extract_segment_q_start,
+                            world_yml=post_grasp_world_yml,
+                        )
+                    except Exception as exc:
+                        extract_segment_left_pose = _copy_pose(segment_left_pose)
+                        extract_segment_right_pose = _copy_pose(segment_right_pose)
+                        self.get_logger().warning(
+                            "[ARM_PICKING] failed to compute FK between Pringles extract segments; "
+                            "falling back to planned segment target poses: "
+                            f"segment={segment_idx + 1}/{extract_segments} error={exc}"
+                        )
+                if extract_plan is None:
+                    raise RuntimeError("[PRINGLES EXTRACT] no extract segment was planned")
+
+                lift_extract_plan = self._postprocess_pringles_bimanual_full_path(
+                    stage="grasp_pringles_lift_extract",
+                    q_ref_cspace=lift_q_start_cspace,
+                    raw_path=full_lift_extract_path,
+                    world_yml=post_grasp_world_yml,
+                )
+                self._wait_for_both_arms(
+                    stage="grasp_pringles_lift_extract",
+                    plan=lift_extract_plan,
+                    full_path=lift_extract_plan.spline_path,
+                    selected_arm="left",
+                    other_arm="right",
+                )
+
+                self.get_logger().info(
+                    "[ARM_PICKING] Pringles dual grasp sequence completed: "
+                    f"label={object_label!r} "
+                    f"left_target={_pose_position_xyz(left_target_pose)} "
+                    f"right_target={_pose_position_xyz(right_target_pose)} "
+                    f"left_inward={_pose_position_xyz(left_inward_pose)} "
+                    f"right_inward={_pose_position_xyz(right_inward_pose)} "
+                    f"left_lift={_pose_position_xyz(left_lift_pose)} "
+                    f"right_lift={_pose_position_xyz(right_lift_pose)} "
+                    f"left_extract={_pose_position_xyz(extract_left_pose)} "
+                    f"right_extract={_pose_position_xyz(extract_right_pose)} "
+                    f"inward_y_m={float(self._args.pringles_dual_grasp_inward_y_m):.3f} "
+                    f"lift_z_m={lift_z_m:.3f}"
+                )
+                self._publish_finish_after_motion_complete(
+                    selected_arm,
+                    stage="grasp_pringles_extract",
+                    use_one_step_finish=False,
+                )
+                return
+            except Exception as exc:
+                grasp_attempt += 1
+                with self._grasp_cv:
+                    grasp_seq = max(grasp_seq, int(self._latest_grasp_seq))
+                self.get_logger().warning(
+                    "[ARM_PICKING] Pringles dual grasp attempt failed; waiting for next ObjectGrasp: "
+                    f"selected_arm={normalize_arm_name(selected_arm)} "
+                    f"attempt={grasp_attempt} seq={grasp_seq} error={exc}"
+                )
+
     def _execute_grasp_sequence(
         self,
         *,
@@ -2752,7 +4108,16 @@ class ArmPickingCoordinator(Node):
         base_world_yml: str | None,
         shelf_type: str,
         use_one_step_finish_on_complete: bool = False,
+        pringles_dual_grasp: bool = False,
     ) -> None:
+        if bool(pringles_dual_grasp):
+            self._execute_pringles_dual_grasp_sequence(
+                selected_arm=selected_arm,
+                base_world_yml=base_world_yml,
+                use_one_step_finish_on_complete=use_one_step_finish_on_complete,
+            )
+            return
+
         shelf_type_key = str(shelf_type).strip().lower()
         is_shelf_1 = shelf_type_key == "shelf_1"
         is_shelf_2 = shelf_type_key == "shelf_2"
@@ -2990,15 +4355,47 @@ class ArmPickingCoordinator(Node):
                 fixed_x_m=float(self._args.align_fixed_x_m),
                 lift_z_m=float(self._args.align_lift_z_m),
             )
+            pringles_dual_align = _is_pringles_align_msg(msg)
+            other_target_pose = None
+            if pringles_dual_align:
+                other_target_pose = _build_other_arm_offset_align_target_pose(
+                    msg,
+                    selected_arm=selected_arm,
+                    other_arm=other_arm,
+                    selected_target_pose=target_pose,
+                    y_separation_m=float(self._args.pringles_dual_align_y_separation_m),
+                    fixed_x_m=float(self._args.align_fixed_x_m),
+                    lift_z_m=float(self._args.align_lift_z_m),
+                )
 
             self.get_logger().info(
                 "[ARM_PICKING] start align: "
                 f"aruco_id={int(msg.aruco_id)} arm={selected_arm} "
+                f"label='{str(getattr(msg, 'label', '')).strip()}' "
                 f"shelf_type='{str(msg.shelf_type).strip()}' "
                 f"sequence_shelf_type='{sequence_shelf_type}' "
                 f"world_yml={world_yml} "
                 f"target=({target_pose.position.x:.3f}, {target_pose.position.y:.3f}, {target_pose.position.z:.3f})"
             )
+            if pringles_dual_align and other_target_pose is not None:
+                self.get_logger().info(
+                    "[ARM_PICKING] Pringles dual-arm align enabled: "
+                    f"selected_arm={selected_arm} other_arm={other_arm} "
+                    f"y_separation_m={float(self._args.pringles_dual_align_y_separation_m):.3f} "
+                    f"other_target=({other_target_pose.position.x:.3f}, "
+                    f"{other_target_pose.position.y:.3f}, {other_target_pose.position.z:.3f})"
+                )
+                if bool(getattr(self._args, "startup_warmup", False)):
+                    self.get_logger().warning(
+                        "[ARM_PICKING] skipping Pringles dynamic bimanual IK warmup during align "
+                        "because startup_warmup is enabled; run without --startup_warmup for "
+                        "the full Pringles bimanual lift path"
+                    )
+                else:
+                    self._get_bimanual_ik_solver(
+                        world_yml=world_yml,
+                        stage="align_pringles_dynamic_world",
+                    )
             _publish_world_collision_for_mujoco(self._args, world_yml)
 
             selected_plan = self._plan_selected_arm(
@@ -3009,23 +4406,55 @@ class ArmPickingCoordinator(Node):
             )
             if shelf_1_single_left_align:
                 full_path = [list(q) for q in selected_plan.spline_path]
-                self.get_logger().info(
-                    "[ARM_PICKING] shelf_1 align uses left arm only; "
-                    "right arm will not receive any align command"
-                )
-                self._wait_for_single_arm(
-                    stage="align",
-                    plan=selected_plan,
-                )
-                record_other_arm = f"{other_arm}_uncontrolled"
+                if pringles_dual_align and other_target_pose is not None:
+                    other_plan = self._plan_selected_arm(
+                        stage="align_other_pringles",
+                        arm=other_arm,
+                        target_pose=other_target_pose,
+                        world_yml=world_yml,
+                        q_start_cspace=selected_plan.q_start_cspace,
+                    )
+                    full_path = _build_combined_full_path(
+                        selected_plan=selected_plan,
+                        other_plan=other_plan,
+                        selected_arm=selected_arm,
+                        other_arm=other_arm,
+                    )
+                    self._wait_for_both_arms(
+                        stage="align_pringles",
+                        plan=selected_plan,
+                        full_path=full_path,
+                        selected_arm=selected_arm,
+                        other_arm=other_arm,
+                    )
+                    record_other_arm = other_arm
+                else:
+                    self.get_logger().info(
+                        "[ARM_PICKING] shelf_1 align uses left arm only; "
+                        "right arm will not receive any align command"
+                    )
+                    self._wait_for_single_arm(
+                        stage="align",
+                        plan=selected_plan,
+                    )
+                    record_other_arm = f"{other_arm}_uncontrolled"
             else:
-                other_plan = self._plan_other_arm_zero(
-                    stage="align_other_zero",
-                    arm=other_arm,
-                    q_start_cspace=selected_plan.q_start_cspace,
-                    cspace_joint_names=selected_plan.cspace_joint_names,
-                    world_yml=world_yml,
-                )
+                if pringles_dual_align and other_target_pose is not None:
+                    other_plan = self._plan_selected_arm(
+                        stage="align_other_pringles",
+                        arm=other_arm,
+                        target_pose=other_target_pose,
+                        world_yml=world_yml,
+                        q_start_cspace=selected_plan.q_start_cspace,
+                    )
+                else:
+                    other_plan = self._plan_other_arm_zero(
+                        stage="align_other_zero",
+                        arm=other_arm,
+                        q_start_cspace=selected_plan.q_start_cspace,
+                        cspace_joint_names=selected_plan.cspace_joint_names,
+                        world_yml=world_yml,
+                    )
                 full_path = _build_combined_full_path(
                     selected_plan=selected_plan,
                     other_plan=other_plan,
@@ -3033,7 +4462,7 @@ class ArmPickingCoordinator(Node):
                     other_arm=other_arm,
                 )
                 self._wait_for_both_arms(
-                    stage="align",
+                    stage="align_pringles" if pringles_dual_align else "align",
                     plan=selected_plan,
                     full_path=full_path,
                     selected_arm=selected_arm,
@@ -3060,6 +4489,7 @@ class ArmPickingCoordinator(Node):
                 base_world_yml=world_yml,
                 shelf_type=sequence_shelf_type,
                 use_one_step_finish_on_complete=shelf_1_single_left_align,
+                pringles_dual_grasp=pringles_dual_align,
             )
         except Exception as exc:
             self.get_logger().error(f"ARM_PICKING align sequence failed: {exc}")
@@ -3127,6 +4557,163 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
         help="z offset [m] added above marker_position.z for non-shelf_1 align targets",
     )
     parser.add_argument(
+        "--pringles_dual_align_y_separation_m",
+        type=float,
+        default=_PRINGLES_DUAL_ALIGN_Y_SEPARATION_M,
+        help="y-axis separation [m] between selected and opposite arm align targets for Pringles ObjectAlign",
+    )
+    parser.add_argument(
+        "--pringles_dual_grasp_side_clearance_m",
+        type=float,
+        default=_PRINGLES_DUAL_GRASP_SIDE_CLEARANCE_M,
+        help="extra y-axis clearance [m] outside half object depth for Pringles dual grasp targets",
+    )
+    parser.add_argument(
+        "--pringles_dual_grasp_x_offset_m",
+        type=float,
+        default=_PRINGLES_DUAL_GRASP_X_OFFSET_M,
+        help="x offset [m] added to object center for both Pringles dual grasp targets",
+    )
+    parser.add_argument(
+        "--pringles_dual_grasp_z_offset_m",
+        type=float,
+        default=_PRINGLES_DUAL_GRASP_Z_OFFSET_M,
+        help="z offset [m] added to object center for both Pringles dual grasp targets",
+    )
+    parser.add_argument(
+        "--pringles_dual_grasp_inward_y_m",
+        type=float,
+        default=_PRINGLES_DUAL_GRASP_INWARD_Y_M,
+        help="single-arm inward y motion [m] after Pringles dual grasp target arrival",
+    )
+    parser.add_argument(
+        "--pringles_dual_grasp_lift_z_m",
+        type=float,
+        default=_PRINGLES_DUAL_GRASP_LIFT_Z_M,
+        help="dual-arm constrained z-axis lift [m] after Pringles inward motion",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_left_xyz_m",
+        type=float,
+        nargs=3,
+        default=list(_PRINGLES_DUAL_EXTRACT_LEFT_XYZ_M),
+        metavar=("X", "Y", "Z"),
+        help="left EE target xyz [m] for constrained Pringles extract after lift",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_segments",
+        type=int,
+        default=_PRINGLES_DUAL_EXTRACT_SEGMENTS,
+        help="number of constrained Pringles extract segments after lift",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_tbrrt_block_k",
+        type=int,
+        default=_PRINGLES_DUAL_EXTRACT_TBRRT_BLOCK_K,
+        help="batch TBRRT block_K used only for the Pringles constrained extract stage",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_tbrrt_time_limit_s",
+        type=float,
+        default=_PRINGLES_DUAL_EXTRACT_TBRRT_TIME_LIMIT_S,
+        help="batch TBRRT time limit [s] used only for the Pringles constrained extract stage",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_max_iters",
+        type=int,
+        default=500000,
+        help="batch TBRRT max iterations used only for the Pringles constrained extract stage",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_ik_attempts",
+        type=int,
+        default=16,
+        help="maximum repeated noisy CuRobo bimanual IK batches for Pringles extract segments",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_ik_seed_noise_std",
+        type=float,
+        default=0.25,
+        help="joint-space seed noise std [rad] for Pringles extract bimanual CuRobo IK",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_direct_edge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="try a projected collision-checked direct edge before batch TBRRT for Pringles extract segments",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_direct_edge_step_q",
+        type=float,
+        default=0.02,
+        help="joint interpolation step [rad] for Pringles extract projected direct-edge check",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_direct_edge_max_points",
+        type=int,
+        default=128,
+        help="maximum projected waypoints for Pringles extract direct-edge check",
+    )
+    parser.add_argument(
+        "--pringles_dual_extract_proj_tol",
+        type=float,
+        default=5.0e-2,
+        help="projection tolerance used only for Pringles extract segment roots",
+    )
+    parser.add_argument(
+        "--pringles_dual_lift_ik_attempts",
+        type=int,
+        default=8,
+        help="maximum repeated CuRobo bimanual IK batches used to find a root-projectable Pringles lift goal",
+    )
+    parser.add_argument(
+        "--pringles_dual_lift_use_seed_config",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="seed Pringles lift CuRobo bimanual IK from the current joint state",
+    )
+    parser.add_argument(
+        "--pringles_dual_lift_proj_tol",
+        type=float,
+        default=5.0e-3,
+        help="projection tolerance used only for the Pringles constrained lift goal roots",
+    )
+    parser.add_argument(
+        "--pringles_dual_lift_goal_topk",
+        type=int,
+        default=16,
+        help="deprecated compatibility option; Pringles lift now lets batch-conext reranking score all root-projectable goals",
+    )
+    parser.add_argument(
+        "--pringles_dual_lift_parallel_cuda_streams",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="run left/right CuRobo bimanual IK solves on parallel CUDA streams during Pringles lift",
+    )
+    parser.add_argument(
+        "--pringles_dual_lift_ik_warmup_iters",
+        type=int,
+        default=1,
+        help="reachable bimanual IK warmup iterations when caching the Pringles lift solver",
+    )
+    parser.add_argument(
+        "--goal_rerank_topk",
+        type=int,
+        default=3,
+        help="number of bimanual IK goals kept by batch-conext precheck reranking",
+    )
+    parser.add_argument(
+        "--goal_rerank_interp_points",
+        type=int,
+        default=6,
+        help="interpolation samples per bimanual IK goal for batch-conext precheck reranking",
+    )
+    parser.add_argument("--proj_iters", type=int, default=60)
+    parser.add_argument("--proj_tol", type=float, default=1.0e-3)
+    parser.add_argument("--proj_damping", type=float, default=0.0)
+    parser.add_argument("--proj_step", type=float, default=1.0)
+    parser.add_argument("--proj_fd_eps", type=float, default=1.0e-3)
+    parser.add_argument(
         "--post_grasp_lift_z_m",
         type=float,
         default=0.05,
@@ -3176,7 +4763,7 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
     parser.add_argument(
         "--startup_warmup",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help="pre-initialize and warm up IK/collision objects before subscribing",
     )
     parser.add_argument(

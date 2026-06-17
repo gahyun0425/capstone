@@ -125,6 +125,7 @@ def plan_single_arm_motion(
     ik_seed_noise_std: float = 0.25,
     ik_seed_random_seed: int = 0,
     ik_goal_dedupe_tol: float = 1.0e-3,
+    use_cuda_graph: bool = True,
     tbrrt_cfg=None,
     tbrrt_block_k: int = 32,
     spline_dt: float = 0.01,
@@ -141,6 +142,7 @@ def plan_single_arm_motion(
         robot_yml,
         arm=normalized_arm,
         cpu=cpu,
+        use_cuda_graph=bool(use_cuda_graph),
         world_yml=world_yml,
     )
     resolved_q_start_cspace = [0.0 for _ in ik.cspace_joint_names]

@@ -104,6 +104,36 @@ def _extract_q_from_result(result, b: int = 0) -> List[float]:
     raise RuntimeError("Failed to extract q from IK result.solution")
 
 
+def _success_flags_from_result(result, batch_size: int) -> List[bool]:
+    if not hasattr(result, "success") or result.success is None:
+        return [False for _ in range(batch_size)]
+
+    success = result.success
+    if isinstance(success, torch.Tensor):
+        flags = success.detach()
+        if flags.ndim == 0:
+            return [bool(flags.item()) for _ in range(batch_size)]
+        if int(flags.shape[0]) != int(batch_size):
+            flat = flags.reshape(-1).detach().cpu().tolist()
+            return [bool(flat[i]) if i < len(flat) else False for i in range(batch_size)]
+        if flags.ndim > 1:
+            flags = flags.reshape(batch_size, -1).any(dim=1)
+        return [bool(v) for v in flags.detach().cpu().tolist()]
+
+    def _nested_bool(value) -> bool:
+        if isinstance(value, (list, tuple)):
+            return any(_nested_bool(v) for v in value)
+        return bool(value)
+
+    if isinstance(success, (list, tuple)):
+        return [
+            _nested_bool(success[i]) if i < len(success) else False
+            for i in range(batch_size)
+        ]
+
+    return [bool(success) for _ in range(batch_size)]
+
+
 def _map_active_q_to_cspace(
     q_active: List[float],
     active_joint_names: List[str],
@@ -408,7 +438,7 @@ class FastBimanualIK:
                 res_l = self.left_solver.solve_batch(goal_left)
             else:
                 res_l = self.left_solver.solve_batch(goal_left, seed_config=q_seed)
-            ok_l = bool(res_l.success[0].detach().cpu().item())
+            ok_l = _success_flags_from_result(res_l, 1)[0]
             if not ok_l:
                 return BimanualIKOutput(False, None, self.active_joint_names, None, self.cspace_joint_names)
             q_l = _extract_q_from_result(res_l)
@@ -417,7 +447,7 @@ class FastBimanualIK:
                 res_r = self.right_solver.solve_batch(goal_right)
             else:
                 res_r = self.right_solver.solve_batch(goal_right, seed_config=q_seed)
-            ok_r = bool(res_r.success[0].detach().cpu().item())
+            ok_r = _success_flags_from_result(res_r, 1)[0]
             if not ok_r:
                 return BimanualIKOutput(False, None, self.active_joint_names, None, self.cspace_joint_names)
             q_r = _extract_q_from_result(res_r)
@@ -573,7 +603,7 @@ class SingleArmIK:
             else:
                 res = self.solver.solve_batch(goal, seed_config=seed_config)
 
-        ok_all = res.success.detach().cpu().tolist()
+        ok_all = _success_flags_from_result(res, batch_size)
         q_out_batch: List[Optional[List[float]]] = [None for _ in range(batch_size)]
         valid_indices: List[int] = []
         valid_q_batch: List[List[float]] = []
@@ -720,6 +750,7 @@ def solve_batch_bimanual(
     q_start_cspace: Optional[List[float]] = None,
     q_seed_cspace_batch: Optional[List[List[float]]] = None,
     parallel_cuda_streams: bool = True,
+    use_seed_config: bool = True,
 ) -> List[BimanualIKOutput]:
     """
     B개의 goal을 한 번에 처리:
@@ -759,11 +790,15 @@ def solve_batch_bimanual(
     else:
         q_base_active_batch = [[0.0 for _ in self.active_joint_names] for _ in range(B)]
 
-    seed_config = _build_seed_config_from_cspace_batch(
-        q_base_cspace_batch,
-        cspace_joint_names=self.cspace_joint_names,
-        active_joint_names=self.active_joint_names,
-        device=self.device,
+    seed_config = (
+        _build_seed_config_from_cspace_batch(
+            q_base_cspace_batch,
+            cspace_joint_names=self.cspace_joint_names,
+            active_joint_names=self.active_joint_names,
+            device=self.device,
+        )
+        if bool(use_seed_config)
+        else None
     )
 
     goal_left = _pose_from_xyz_quat_wxyz_batch(left_xyz_batch, left_quat_wxyz_batch, self.device)
@@ -798,8 +833,8 @@ def solve_batch_bimanual(
                 res_l = self.left_solver.solve_batch(goal_left, seed_config=seed_config)
                 res_r = self.right_solver.solve_batch(goal_right, seed_config=seed_config)
 
-    ok_l = res_l.success.detach().cpu().tolist()
-    ok_r = res_r.success.detach().cpu().tolist()
+    ok_l = _success_flags_from_result(res_l, B)
+    ok_r = _success_flags_from_result(res_r, B)
 
     # solver joint_names 기반 map 준비 (매 batch마다 재사용)
     l_names = list(self.left_solver.kinematics.joint_names)
