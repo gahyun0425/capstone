@@ -115,10 +115,11 @@ _SNACK_FALLBACK_Z_OFFSET_M = 0.02
 _SNACK_FALLBACK_YAW_OFFSET_RAD = -0.5 * math.pi
 _SNACK_COLLISION_OBJECT_SIZE_Y_M = 0.08
 _PRINGLES_DUAL_ALIGN_Y_SEPARATION_M = 0.50
-_PRINGLES_DUAL_GRASP_SIDE_CLEARANCE_M = 0.05
+_PRINGLES_DUAL_GRASP_SIDE_CLEARANCE_M = 0.08
 _PRINGLES_DUAL_GRASP_X_OFFSET_M = 0.01
 _PRINGLES_DUAL_GRASP_Z_OFFSET_M = 0.01
 _PRINGLES_DUAL_GRASP_INWARD_Y_M = 0.06
+_PRINGLES_DUAL_INWARD_POST_JOINT_STATE_DELAY_S = 2.0
 _PRINGLES_DUAL_GRASP_LIFT_Z_M = 0.03
 _PRINGLES_DUAL_EXTRACT_LEFT_XYZ_M = (0.40, 0.16, 1.40)
 _PRINGLES_DUAL_EXTRACT_SEGMENTS = 8
@@ -2463,11 +2464,18 @@ class ArmPickingCoordinator(Node):
                     if attempt_best_residual < best_root_residual:
                         best_root_residual = attempt_best_residual
                         best_root_success = any(root_success)
-                root_projectable_q = [
-                    [float(v) for v in q_goal]
-                    for q_goal, success in zip(free_q, root_success)
-                    if bool(success)
+                projected_free_q = [
+                    [float(v) for v in row]
+                    for row in root_proj.q_proj.detach().cpu().tolist()
                 ]
+                root_projectable_q = []
+                for q_goal, success in zip(projected_free_q, root_success):
+                    if not bool(success):
+                        continue
+                    in_collision, _d_self_max, _d_world_max = checker.check_single(q_goal)
+                    if bool(in_collision):
+                        continue
+                    root_projectable_q.append([float(v) for v in q_goal])
 
             self.get_logger().info(
                 f"[PRINGLES {stage_tag}] bimanual IK attempt: "
@@ -3851,15 +3859,58 @@ class ArmPickingCoordinator(Node):
                     selected_arm="left",
                     other_arm="right",
                 )
-                self._wait_for_both_arms(
-                    stage="grasp_pringles_inward",
+                self.get_logger().info(
+                    "[TRAJ] Pringles inward trajectory ready; publishing without arrival feedback: "
+                    f"stage=grasp_pringles_inward waypoints={len(inward_full_path)}"
+                )
+                self._publish_motion_commands(
                     plan=left_inward_plan,
                     full_path=inward_full_path,
                     selected_arm="left",
                     other_arm="right",
                 )
+                self.get_logger().info(
+                    "[ARM_PICKING] Pringles inward command sent without arrival feedback; "
+                    "waiting for timed completion before lift/extract planning: "
+                    f"left_inward={_pose_position_xyz(left_inward_pose)} "
+                    f"right_inward={_pose_position_xyz(right_inward_pose)} "
+                    f"inward_y_m={float(self._args.pringles_dual_grasp_inward_y_m):.3f}"
+                )
 
                 lift_z_m = float(self._args.pringles_dual_grasp_lift_z_m)
+                inward_traj_duration_s = (
+                    max(0, len(inward_full_path) - 1) * float(self._args.publish_dt)
+                )
+                inward_start_delay_s = (
+                    max(0.0, float(getattr(self._args, "start_delay_s", 0.0)))
+                    if str(self._args.publish_mode) == "real"
+                    else 0.0
+                )
+                inward_post_delay_s = max(
+                    0.0,
+                    float(
+                        getattr(
+                            self._args,
+                            "pringles_dual_inward_post_joint_state_delay_s",
+                            _PRINGLES_DUAL_INWARD_POST_JOINT_STATE_DELAY_S,
+                        )
+                    ),
+                )
+                inward_wait_s = (
+                    float(inward_start_delay_s)
+                    + float(inward_traj_duration_s)
+                    + float(inward_post_delay_s)
+                )
+                self.get_logger().info(
+                    "[ARM_PICKING] waiting before Pringles lift joint-state read: "
+                    f"trajectory_s={inward_traj_duration_s:.3f} "
+                    f"start_delay_s={inward_start_delay_s:.3f} "
+                    f"post_delay_s={inward_post_delay_s:.3f} "
+                    f"total_wait_s={inward_wait_s:.3f}"
+                )
+                if inward_wait_s > 0.0:
+                    time.sleep(inward_wait_s)
+
                 try:
                     lift_q_start_cspace = read_joint_positions_once(
                         list(CSPACE_JOINT_NAMES_14),
@@ -3868,14 +3919,15 @@ class ArmPickingCoordinator(Node):
                     )
                     planned_lift_start = [float(v) for v in inward_full_path[-1]]
                     self.get_logger().info(
-                        "[ARM_PICKING] Pringles lift uses current joint state as q_start/q_ref: "
-                        f"delta_from_planned={_joint_delta_l2(lift_q_start_cspace, planned_lift_start):.6f}"
+                        "[ARM_PICKING] Pringles lift/rigid constraint uses joint state "
+                        "read after inward timed completion: "
+                        f"delta_from_planned_inward={_joint_delta_l2(lift_q_start_cspace, planned_lift_start):.6f}"
                     )
                 except RuntimeError as exc:
                     lift_q_start_cspace = [float(v) for v in inward_full_path[-1]]
                     self.get_logger().warning(
-                        "[ARM_PICKING] failed to read current joint state before Pringles lift; "
-                        "falling back to planned inward endpoint as q_start/q_ref: "
+                        "[ARM_PICKING] failed to read joint state after Pringles inward timed completion; "
+                        "falling back to planned inward endpoint as lift q_start/q_ref: "
                         f"{exc}"
                     )
                 try:
@@ -3925,23 +3977,31 @@ class ArmPickingCoordinator(Node):
                     "using planned lift endpoint as extract q_start; full lift/extract "
                     "trajectory will be postprocessed and published once."
                 )
+                extract_current_left_pose = _copy_pose(left_lift_pose)
+                extract_current_right_pose = _copy_pose(right_lift_pose)
                 try:
-                    extract_current_left_pose = self._compute_ee_pose_from_cspace(
+                    actual_extract_left_pose = self._compute_ee_pose_from_cspace(
                         arm="left",
                         q_cspace=extract_q_start_cspace,
                         world_yml=post_grasp_world_yml,
                     )
-                    extract_current_right_pose = self._compute_ee_pose_from_cspace(
+                    actual_extract_right_pose = self._compute_ee_pose_from_cspace(
                         arm="right",
                         q_cspace=extract_q_start_cspace,
                         world_yml=post_grasp_world_yml,
                     )
+                    self.get_logger().info(
+                        "[ARM_PICKING] Pringles extract targets use planned lift poses "
+                        "to keep the fixed rigid constraint reference; "
+                        f"actual_left_after_lift={_pose_position_xyz(actual_extract_left_pose)} "
+                        f"actual_right_after_lift={_pose_position_xyz(actual_extract_right_pose)} "
+                        f"planned_left_lift={_pose_position_xyz(extract_current_left_pose)} "
+                        f"planned_right_lift={_pose_position_xyz(extract_current_right_pose)}"
+                    )
                 except Exception as exc:
-                    extract_current_left_pose = _copy_pose(left_lift_pose)
-                    extract_current_right_pose = _copy_pose(right_lift_pose)
                     self.get_logger().warning(
-                        "[ARM_PICKING] failed to compute current FK before Pringles extract; "
-                        "falling back to planned lift poses: "
+                        "[ARM_PICKING] failed to compute actual FK before Pringles extract; "
+                        "using planned lift poses for extract targets: "
                         f"{exc}"
                     )
                 extract_left_pose, extract_right_pose = _build_pringles_extract_target_poses(
@@ -4035,25 +4095,8 @@ class ArmPickingCoordinator(Node):
                         float(q) + float(d)
                         for q, d in zip(extract_segment_q_start, segment_delta_hint)
                     ]
-                    try:
-                        extract_segment_left_pose = self._compute_ee_pose_from_cspace(
-                            arm="left",
-                            q_cspace=extract_segment_q_start,
-                            world_yml=post_grasp_world_yml,
-                        )
-                        extract_segment_right_pose = self._compute_ee_pose_from_cspace(
-                            arm="right",
-                            q_cspace=extract_segment_q_start,
-                            world_yml=post_grasp_world_yml,
-                        )
-                    except Exception as exc:
-                        extract_segment_left_pose = _copy_pose(segment_left_pose)
-                        extract_segment_right_pose = _copy_pose(segment_right_pose)
-                        self.get_logger().warning(
-                            "[ARM_PICKING] failed to compute FK between Pringles extract segments; "
-                            "falling back to planned segment target poses: "
-                            f"segment={segment_idx + 1}/{extract_segments} error={exc}"
-                        )
+                    extract_segment_left_pose = _copy_pose(segment_left_pose)
+                    extract_segment_right_pose = _copy_pose(segment_right_pose)
                 if extract_plan is None:
                     raise RuntimeError("[PRINGLES EXTRACT] no extract segment was planned")
 
@@ -4585,6 +4628,12 @@ def build_arm_picking_action_parser(argv: Sequence[str] | None = None):
         type=float,
         default=_PRINGLES_DUAL_GRASP_INWARD_Y_M,
         help="single-arm inward y motion [m] after Pringles dual grasp target arrival",
+    )
+    parser.add_argument(
+        "--pringles_dual_inward_post_joint_state_delay_s",
+        type=float,
+        default=_PRINGLES_DUAL_INWARD_POST_JOINT_STATE_DELAY_S,
+        help="extra wait [s] after the timed Pringles inward trajectory before reading joint state for the lift/extract constraint",
     )
     parser.add_argument(
         "--pringles_dual_grasp_lift_z_m",
